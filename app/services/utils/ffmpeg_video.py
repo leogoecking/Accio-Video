@@ -1,5 +1,4 @@
 import os
-import random
 import re
 import subprocess
 from typing import Tuple

@@ -2,7 +2,6 @@ import os
 import subprocess
 import tempfile
 import unittest
-from pathlib import Path
 from PIL import Image
 
 from app.services.utils import ffmpeg_video
