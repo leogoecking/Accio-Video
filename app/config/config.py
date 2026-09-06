@@ -524,6 +524,10 @@ def save_config():
                 f.flush()
                 os.fsync(f.fileno())
             try:
+                os.chmod(temp_path, 0o666)
+            except OSError:
+                pass
+            try:
                 os.replace(temp_path, config_file)
             except OSError as exc:
                 if exc.errno != errno.EBUSY:

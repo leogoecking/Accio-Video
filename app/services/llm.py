@@ -269,21 +269,49 @@ def _generate_response(prompt: str, app_config=None) -> str:
                 ],
             )
 
-            try:
-                # 新版 google-genai 通过统一 Client 暴露模型服务。上下文管理器
-                # 会在请求结束后关闭底层 HTTP 连接，避免频繁生成时积累连接资源。
-                with genai.Client(
-                    api_key=api_key,
-                    http_options=http_options,
-                ) as client:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=generation_config,
-                    )
-                generated_text = response.text
-            except (AttributeError, IndexError, ValueError) as e:
-                logger.warning(f"gemini returned invalid response content: {str(e)}")
+            fallback_models = [model_name] if model_name else []
+            for alt in [
+                "gemini-2.5-flash",
+                "gemini-3.7-flash",
+                "gemini-3.1-flash-lite",
+                "gemini-3.6-flash",
+                "gemini-flash-latest",
+            ]:
+                if alt not in fallback_models:
+                    fallback_models.append(alt)
+
+            generated_text = None
+            last_error = None
+
+            with genai.Client(
+                api_key=api_key,
+                http_options=http_options,
+            ) as client:
+                for candidate_model in fallback_models:
+                    try:
+                        response = client.models.generate_content(
+                            model=candidate_model,
+                            contents=prompt,
+                            config=generation_config,
+                        )
+                        if response and response.text:
+                            generated_text = response.text
+                            if candidate_model != model_name:
+                                logger.info(
+                                    f"gemini fallback model succeeded: configured={model_name!r}, "
+                                    f"used={candidate_model!r}"
+                                )
+                            break
+                    except Exception as exc:
+                        last_error = exc
+                        logger.warning(
+                            f"gemini model {candidate_model!r} failed: {exc}. Trying next candidate..."
+                        )
+
+            if not generated_text:
+                if last_error:
+                    logger.error(f"all gemini models failed: {last_error}")
+                    raise last_error
                 raise ValueError(f"[{llm_provider}] returned invalid response content")
 
             return _normalize_text_response(generated_text, llm_provider)
@@ -621,26 +649,26 @@ def generate_terms(
     else:
         goal = (
             f"Generate {amount} search terms for stock videos, depending on the "
-            "subject of a video."
+            "subject and visual concepts of the video."
         )
         ordering_rule = ""
         output_example = (
-            '["search term 1", "search term 2", "search term 3",'
-            '"search term 4", "search term 5"]'
+            '["dramatic ocean waves", "person walking in rainy city", "hands typing on laptop keyboard",'
+            '"crowded subway station", "sunrise over mountains"]'
         )
 
     prompt = f"""
-# Role: Video Search Terms Generator
+# Role: Professional Stock Video Search Query Generator
 
 ## Goals:
 {goal}
 
-## Constrains:
+## Rules and Guidelines:
 1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 words, always add the main subject of the video.
-3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
-4. the search terms must be related to the subject of the video.
-5. reply with english search terms only.
+2. each search query should consist of 2-4 concrete, descriptive English words representing real-world visual stock footage (e.g. Subject + Action + Setting like "businessman checking watch", "coffee brewing close up", "drone view modern city").
+3. avoid overly abstract or metaphorical words (e.g. do not search "future success", search "smiling person celebrating in modern office").
+4. do not force the main title into every tag; prioritize what should actually be VISIBLE on screen for each moment in the narration.
+5. reply with english search terms only; Chinese or other languages are not accepted.
 {ordering_rule}
 
 ## Output Example:
@@ -653,7 +681,7 @@ def generate_terms(
 ### Video Script
 {video_script}
 
-Please note that you must use English for generating video search terms; Chinese is not accepted.
+Please note that you must use English for generating video search terms.
 """.strip()
 
     logger.info(f"subject: {video_subject}, match_script_order: {match_script_order}")
