@@ -3631,6 +3631,7 @@ def _render_video_settings(panel, params):
                 (tr("Pexels"), "pexels"),
                 (tr("Pixabay"), "pixabay"),
                 (tr("Coverr"), "coverr"),
+                (tr("AI Image (Ken Burns)"), "ai_image"),
                 (tr("WaveSpeed AI Video"), "wavespeed"),
                 (tr("Shengsuan Cloud AI Video"), "loomloom"),
                 (tr("Local file"), "local"),
@@ -3648,6 +3649,32 @@ def _render_video_settings(panel, params):
                 )[value],
             )
             _set_runtime_config("app", "video_source", params.video_source)
+
+            if params.video_source in ("pexels", "pixabay", "coverr"):
+                enable_ai_fallback = st.checkbox(
+                    tr("Enable AI Image Fallback (Ken Burns)"),
+                    value=bool(config.app.get("enable_ai_image_fallback", True)),
+                    key="enable_ai_image_fallback_checkbox",
+                    help=tr("AI Image Fallback Help"),
+                )
+                _set_runtime_config("app", "enable_ai_image_fallback", enable_ai_fallback)
+
+            if params.video_source == "ai_image" or config.app.get("enable_ai_image_fallback", True):
+                ai_image_providers = [
+                    (tr("Pollinations (Flux Free)"), "pollinations"),
+                    (tr("Google Gemini Image"), "gemini"),
+                ]
+                saved_ai_provider = config.app.get("ai_image_provider", "pollinations")
+                chosen_ai_provider = stable_selectbox(
+                    tr("AI Image Provider"),
+                    options=[v for _, v in ai_image_providers],
+                    default_value=saved_ai_provider,
+                    key="ai_image_provider_select",
+                    format_func=lambda value: dict(
+                        (v, label) for label, v in ai_image_providers
+                    ).get(value, value),
+                )
+                _set_runtime_config("app", "ai_image_provider", chosen_ai_provider)
 
             if params.video_source == "wavespeed":
                 st.caption(tr("WaveSpeed AI Video Help"))
@@ -5553,6 +5580,7 @@ def _render_generation_controls(
             "pexels",
             "pixabay",
             "coverr",
+            "ai_image",
             "wavespeed",
             "loomloom",
             "local",

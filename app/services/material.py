@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import threading
 import time
 from pathlib import Path
@@ -12,7 +13,7 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 
 from app.config import config
 from app.models.schema import MaterialInfo, VideoAspect, VideoConcatMode
-from app.services import material_cache, task_artifacts
+from app.services import ai_image, material_cache, task_artifacts
 from app.utils import utils
 
 # Thread-safe counter for API key rotation
@@ -324,46 +325,68 @@ def search_videos_pexels(
             logger.error("pexels video search returned an unsupported response")
             return video_items
         videos = response["videos"]
-        # loop through each video in the result
         for v in videos:
-            duration = v["duration"]
+            if not isinstance(v, dict):
+                continue
+            try:
+                duration = int(float(v.get("duration") or 0))
+            except (TypeError, ValueError):
+                duration = 0
             # check if video has desired minimum duration
             if duration < minimum_duration:
                 continue
-            video_files = v["video_files"]
-            # loop through each url to determine the best quality
+            video_files = v.get("video_files") or []
+            if not isinstance(video_files, list):
+                continue
+
+            matching_renditions = []
             for video in video_files:
-                w = int(video["width"])
-                h = int(video["height"])
-                if (
-                    _matches_video_aspect(w, h, aspect)
-                    and w == video_width
-                    and h == video_height
-                ):
-                    item = MaterialInfo()
-                    item.provider = "pexels"
-                    item.url = video["link"]
-                    item.duration = duration
-                    item.source_info = {
-                        "provider": "pexels",
-                        "search_term": search_term,
-                        "asset_id": (
-                            str(v.get("id")) if v.get("id") is not None else None
-                        ),
-                        "source_page": _safe_public_url(v.get("url")),
-                        "creator": _creator_info(v.get("user")),
-                        "rendition": {
-                            "id": (
-                                str(video.get("id"))
-                                if video.get("id") is not None
-                                else None
-                            ),
-                            "width": w,
-                            "height": h,
-                        },
-                    }
-                    video_items.append(item)
+                if not isinstance(video, dict) or not video.get("link"):
+                    continue
+                try:
+                    w = int(video.get("width") or 0)
+                    h = int(video.get("height") or 0)
+                except (ValueError, TypeError):
+                    continue
+                if _matches_video_aspect(w, h, aspect):
+                    matching_renditions.append((w, h, video))
+
+            if not matching_renditions:
+                continue
+
+            # Prefer exact target resolution if available, else pick highest resolution
+            best_rendition = None
+            for w, h, video in matching_renditions:
+                if w == video_width and h == video_height:
+                    best_rendition = (w, h, video)
                     break
+            if not best_rendition:
+                best_rendition = max(matching_renditions, key=lambda item: item[0] * item[1])
+
+            w, h, video = best_rendition
+            item = MaterialInfo()
+            item.provider = "pexels"
+            item.url = video["link"]
+            item.duration = duration
+            item.source_info = {
+                "provider": "pexels",
+                "search_term": search_term,
+                "asset_id": (
+                    str(v.get("id")) if v.get("id") is not None else None
+                ),
+                "source_page": _safe_public_url(v.get("url")),
+                "creator": _creator_info(v.get("user")),
+                "rendition": {
+                    "id": (
+                        str(video.get("id"))
+                        if video.get("id") is not None
+                        else None
+                    ),
+                    "width": w,
+                    "height": h,
+                },
+            }
+            video_items.append(item)
         return video_items
     except Exception as e:
         logger.error(
@@ -985,6 +1008,11 @@ def _save_wavespeed_video_with_retry(video_url: str, save_dir: str) -> str:
 
 
 def save_video(video_url: str, save_dir: str = "") -> str:
+    if not video_url:
+        return ""
+    if os.path.exists(video_url) and os.path.isfile(video_url):
+        return video_url
+
     if not save_dir:
         save_dir = utils.storage_dir("cache_videos")
 
@@ -1137,6 +1165,36 @@ def _search_videos_with_cache(
         return items
 
 
+def _search_videos_with_query_fallback(
+    search_fn: Callable[[str], List[MaterialInfo]],
+    search_term: str,
+) -> List[MaterialInfo]:
+    """当复杂多词查询未返回素材时，自动降级尝试精简查询词。"""
+    if not isinstance(search_term, str) or not search_term.strip():
+        return []
+    items = search_fn(search_term)
+    if items:
+        return items
+
+    cleaned_term = re.sub(r"[^\w\s]", " ", search_term).strip()
+    words = cleaned_term.split()
+    if len(words) > 2:
+        candidate_fallbacks = [
+            " ".join(words[:2]),
+            " ".join(words[-2:]),
+        ]
+        for fallback in candidate_fallbacks:
+            if fallback and fallback.lower() != search_term.lower():
+                fallback_items = search_fn(fallback)
+                if fallback_items:
+                    logger.info(
+                        f"material search query fallback succeeded: "
+                        f"original={search_term!r}, fallback={fallback!r}, count={len(fallback_items)}"
+                    )
+                    return fallback_items
+    return items
+
+
 def download_videos(
     task_id: str,
     search_terms: List[str],
@@ -1161,12 +1219,15 @@ def download_videos(
         minimum_duration: int,
         video_aspect: VideoAspect,
     ) -> List[MaterialInfo]:
-        return _search_videos_with_cache(
-            provider=provider,
-            search_videos=remote_search_videos,
+        return _search_videos_with_query_fallback(
+            lambda term: _search_videos_with_cache(
+                provider=provider,
+                search_videos=remote_search_videos,
+                search_term=term,
+                minimum_duration=minimum_duration,
+                video_aspect=video_aspect,
+            ),
             search_term=search_term,
-            minimum_duration=minimum_duration,
-            video_aspect=video_aspect,
         )
 
     material_directory = config.app.get("material_directory", "").strip()
@@ -1174,6 +1235,16 @@ def download_videos(
         material_directory = utils.task_dir(task_id)
     elif material_directory and not os.path.isdir(material_directory):
         material_directory = ""
+
+    if source == "ai_image":
+        return _download_videos_ai_image_on_demand(
+            task_id=task_id,
+            search_terms=search_terms,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+        )
 
     if source == "wavespeed":
         # AI 生成按条计费，不能沿用库存源"先为全部关键词取回候选、再挑选"
@@ -1211,11 +1282,29 @@ def download_videos(
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
 
+        found_for_term = False
         for item in video_items:
             if item.url not in valid_video_urls:
                 valid_video_items.append(item)
                 valid_video_urls.append(item.url)
                 found_duration += item.duration
+                found_for_term = True
+
+        if not found_for_term and config.app.get("enable_ai_image_fallback", True):
+            try:
+                ai_clip_item = ai_image.generate_ai_video_clip(
+                    prompt=search_term,
+                    duration=float(max_clip_duration),
+                    video_aspect=video_aspect,
+                    save_dir=material_directory or None,
+                )
+                if ai_clip_item and ai_clip_item.url not in valid_video_urls:
+                    valid_video_items.append(ai_clip_item)
+                    valid_video_urls.append(ai_clip_item.url)
+                    found_duration += ai_clip_item.duration
+                    logger.info(f"AI image Ken Burns clip added for '{search_term}'")
+            except Exception as e:
+                logger.warning(f"AI image fallback failed for '{search_term}': {e}")
 
     logger.info(
         f"found total videos: {len(valid_video_items)}, required duration: {audio_duration} seconds, found duration: {found_duration} seconds"
@@ -1267,6 +1356,88 @@ def download_videos(
                 f"detail={_redact_request_error(e, item.url)}"
             )
     logger.success(f"downloaded {len(video_paths)} videos")
+    _persist_material_sources(task_id, material_sources)
+    return video_paths
+
+
+def _download_videos_ai_image_on_demand(
+    *,
+    task_id: str,
+    search_terms: List[str],
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+) -> List[str]:
+    """
+    按脚本片段顺序逐段生成 AI 图像并转换为带有电影级 Ken Burns 运镜的视频片段。
+    确保生成足够数量的独立画面，完整覆盖整段配音时长。
+    """
+    import math
+
+    video_paths: List[str] = []
+    material_sources: list[dict[str, Any]] = []
+    total_duration = 0.0
+    provider = config.app.get("ai_image_provider", "pollinations")
+
+    # 1. 根据配音总时长精准计算所需的独立镜头数
+    clip_dur = max(2, int(max_clip_duration or 4))
+    needed_clips = math.ceil(max(audio_duration, 1.0) / clip_dur)
+
+    # 2. 如果提供的搜索词少于所需片段数，自动扩充提示词视角，确保每个片段都有独特生动的画面
+    valid_base_terms = [t.strip() for t in search_terms if isinstance(t, str) and t.strip()]
+    if not valid_base_terms:
+        valid_base_terms = ["cinematic scene"]
+    expanded_terms = list(valid_base_terms)
+    angle_modifiers = [
+        "cinematic close up shot",
+        "wide angle establishing view",
+        "dynamic angle perspective",
+        "detailed focus shot",
+        "atmospheric overhead view",
+        "dramatic eye level angle",
+    ]
+    mod_idx = 0
+    while len(expanded_terms) < needed_clips:
+        base_term = valid_base_terms[len(expanded_terms) % len(valid_base_terms)]
+        modifier = angle_modifiers[mod_idx % len(angle_modifiers)]
+        expanded_terms.append(f"{base_term}, {modifier}")
+        mod_idx += 1
+
+    for idx, search_term in enumerate(expanded_terms):
+        try:
+            motion = "zoom_out" if idx % 2 == 1 else "zoom_in"
+            item = ai_image.generate_ai_video_clip(
+                prompt=search_term,
+                duration=float(clip_dur),
+                video_aspect=video_aspect,
+                provider=provider,
+                save_dir=material_directory or None,
+                motion=motion,
+            )
+            if not item:
+                continue
+            saved_video_path = save_video(item.url, save_dir=material_directory)
+            if not saved_video_path:
+                continue
+            logger.info(f"AI image video saved ({idx+1}/{max(needed_clips, len(expanded_terms))}): {saved_video_path}")
+            video_paths.append(saved_video_path)
+            try:
+                material_sources.append(_material_source_record(item, saved_video_path))
+            except Exception as source_error:
+                logger.warning(
+                    f"failed to prepare material source record: provider={item.provider}, error={source_error}"
+                )
+            total_duration += min(clip_dur, item.duration)
+            if total_duration >= audio_duration:
+                logger.info(
+                    f"AI generated materials cover required duration: generated={total_duration:.1f}s, required={audio_duration:.1f}s"
+                )
+                break
+        except Exception as exc:
+            logger.warning(f"failed to generate AI image clip for {search_term!r}: {exc}")
+
+    logger.success(f"generated and prepared {len(video_paths)} distinct AI image videos")
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
@@ -1381,6 +1552,23 @@ def _download_videos_by_script_order(
             term_items.append(item)
             valid_video_urls.add(item.url)
             found_duration += item.duration
+
+        # If zero stock videos found for this ordered term, trigger AI Image Ken Burns fallback
+        if not term_items and config.app.get("enable_ai_image_fallback", True):
+            try:
+                ai_clip_item = ai_image.generate_ai_video_clip(
+                    prompt=search_term,
+                    duration=float(max_clip_duration),
+                    video_aspect=video_aspect,
+                    save_dir=material_directory or None,
+                )
+                if ai_clip_item:
+                    term_items.append(ai_clip_item)
+                    valid_video_urls.add(ai_clip_item.url)
+                    found_duration += ai_clip_item.duration
+                    logger.info(f"AI image Ken Burns clip added for '{search_term}'")
+            except Exception as e:
+                logger.warning(f"AI image fallback failed for '{search_term}': {e}")
 
         if term_items:
             candidate_groups.append((search_term, term_items))

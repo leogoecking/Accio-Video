@@ -321,6 +321,12 @@
     "Confirm WaveSpeed Charge Required": "Por favor, confirma el coste de generación de WaveSpeed antes de generar el vídeo.",
     "Video Encoder": "Codificador de vídeo",
     "Default Video Encoder": "Predeterminado (recomendado)",
-    "Video Encoder Help": "Opción avanzada. Predeterminado sigue la política estable de la aplicación, actualmente libx264. Si un codificador de hardware no está disponible, la aplicación vuelve automáticamente a libx264."
+    "Video Encoder Help": "Opción avanzada. Predeterminado sigue la política estable de la aplicación, actualmente libx264. Si un codificador de hardware no está disponible, la aplicación vuelve automáticamente a libx264.",
+    "AI Image (Ken Burns)": "Imagen IA (Ken Burns Dinámico)",
+    "AI Image Provider": "Proveedor de Imagen IA",
+    "Pollinations (Flux Free)": "Pollinations (Flux Gratis)",
+    "Google Gemini Image": "Google Gemini Imagen",
+    "Enable AI Image Fallback (Ken Burns)": "Activar respaldo con Imagen IA (Ken Burns)",
+    "AI Image Fallback Help": "Genera automáticamente imágenes por IA con movimiento cinematográfico Ken Burns cuando no se encuentran videos de stock."
   }
 }

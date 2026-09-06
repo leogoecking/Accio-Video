@@ -1655,6 +1655,73 @@ class TestWaveSpeedProvider(unittest.TestCase):
         self.assertEqual(generate.call_count, 2)
         self.assertEqual(result, ["/tmp/wavespeed-2.mp4"])
 
+    def test_search_videos_pexels_selects_highest_quality_matching_rendition(self):
+        """Pexels 搜索应优先选择最高可用分辨率的竖屏/横屏视频，而不是仅限 1080x1920。"""
+        config.app["pexels_api_keys"] = ["pexels-key"]
+        config.proxy.clear()
+
+        fake_response = SimpleNamespace(
+            json=lambda: {
+                "videos": [
+                    {
+                        "id": 100,
+                        "duration": 10,
+                        "video_files": [
+                            {"id": 1, "width": 720, "height": 1280, "link": "https://cdn.example.com/720p.mp4"},
+                            {"id": 2, "width": 2160, "height": 3840, "link": "https://cdn.example.com/4k.mp4"},
+                            {"id": 3, "width": 1080, "height": 1920, "link": "https://cdn.example.com/1080p.mp4"},
+                        ],
+                    }
+                ]
+            }
+        )
+
+        with patch("app.services.material.requests.get", return_value=fake_response):
+            results = material.search_videos_pexels(
+                "ocean",
+                minimum_duration=1,
+                video_aspect=material.VideoAspect.portrait,
+            )
+
+        self.assertEqual(len(results), 1)
+        # 目标是 portrait (1080x1920)，若有完全匹配则优先匹配，无则选最高分辨率
+        self.assertEqual(results[0].source_info["rendition"]["width"], 1080)
+        self.assertEqual(results[0].source_info["rendition"]["height"], 1920)
+
+    def test_search_videos_with_query_fallback_simplifies_multi_word_queries(self):
+        """多词查询返回空时，自动降级为前后简化词组重试。"""
+        queries_attempted = []
+
+        def fake_search_fn(query):
+            queries_attempted.append(query)
+            if query == "dark alley":
+                m = material.MaterialInfo()
+                m.provider = "pexels"
+                m.url = "https://cdn.example.com/alley.mp4"
+                return [m]
+            return []
+
+        results = material._search_videos_with_query_fallback(
+            fake_search_fn,
+            "person walking in dark alley",
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].url, "https://cdn.example.com/alley.mp4")
+        self.assertIn("person walking in dark alley", queries_attempted)
+        self.assertIn("dark alley", queries_attempted)
+
+    def test_search_videos_with_query_fallback_handles_empty_query(self):
+        """空查询或空白字符应直接返回空列表，不产生外部调用。"""
+        calls = []
+        result = material._search_videos_with_query_fallback(
+            lambda q: calls.append(q) or [],
+            "   ",
+        )
+        self.assertEqual(result, [])
+        self.assertEqual(len(calls), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+

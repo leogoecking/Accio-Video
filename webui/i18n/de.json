@@ -321,6 +321,12 @@
     "WaveSpeed Billing Notice Without Script": "Jeder generierte Clip wird von WaveSpeed einzeln berechnet. Geben Sie das Videoskript ein oder generieren Sie es, um eine geschätzte Clip-Anzahl zu sehen. Die Generierung erfolgt Segment für Segment und stoppt, sobald genügend Material vorliegt.",
     "Confirm WaveSpeed Charge": "Ich verstehe, dass die WaveSpeed-Videogenerierung ein kostenpflichtiger Dienst ist",
     "Confirm WaveSpeed Charge Help": "Clips werden bedarfsgesteuert Segment für Segment generiert; die Generierung stoppt, sobald das Material die Sprecherdauer abdeckt. Die Gebühren berechnet WaveSpeed pro generiertem Clip.",
-    "Confirm WaveSpeed Charge Required": "Bitte bestätigen Sie die WaveSpeed-Generierungskosten, bevor Sie das Video erstellen."
+    "Confirm WaveSpeed Charge Required": "Bitte bestätigen Sie die WaveSpeed-Generierungskosten, bevor Sie das Video erstellen.",
+    "AI Image (Ken Burns)": "KI-Bild (Ken Burns Dynamik)",
+    "AI Image Provider": "KI-Bildanbieter",
+    "Pollinations (Flux Free)": "Pollinations (Flux Kostenlos)",
+    "Google Gemini Image": "Google Gemini Bild",
+    "Enable AI Image Fallback (Ken Burns)": "KI-Bild Fallback aktivieren (Ken Burns)",
+    "AI Image Fallback Help": "Erzeugt automatisch KI-Bilder mit filmischer Ken-Burns-Kamerabewegung, wenn keine passenden Stock-Videos gefunden werden."
   }
 }

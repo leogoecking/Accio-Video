@@ -321,6 +321,12 @@
     "Confirm WaveSpeed Charge Required": "Lütfen videoyu oluşturmadan önce WaveSpeed üretim ücretini onaylayın.",
     "Video Encoder": "Video Kodlayıcı",
     "Default Video Encoder": "Varsayılan (Önerilen)",
-    "Video Encoder Help": "Gelişmiş seçenek. Varsayılan, uygulamanın kararlı kodlayıcı politikasını izler; şu anda libx264 kullanılır. Donanım kodlayıcı kullanılamıyorsa uygulama otomatik olarak libx264'e döner."
+    "Video Encoder Help": "Gelişmiş seçenek. Varsayılan, uygulamanın kararlı kodlayıcı politikasını izler; şu anda libx264 kullanılır. Donanım kodlayıcı kullanılamıyorsa uygulama otomatik olarak libx264'e döner.",
+    "AI Image (Ken Burns)": "Yapay Zeka Görseli (Ken Burns)",
+    "AI Image Provider": "Yapay Zeka Görsel Sağlayıcı",
+    "Pollinations (Flux Free)": "Pollinations (Ücretsiz Flux)",
+    "Google Gemini Image": "Google Gemini Görsel",
+    "Enable AI Image Fallback (Ken Burns)": "Yapay Zeka Görsel Yedeklemeyi Etkinleştir",
+    "AI Image Fallback Help": "Eşleşen stok video bulunamadığında otomatik olarak sinematik Ken Burns hareketli yapay zeka görselleri oluşturur."
   }
 }

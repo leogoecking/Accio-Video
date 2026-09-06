@@ -321,6 +321,12 @@
     "Confirm WaveSpeed Charge Required": "Harap konfirmasi biaya pembuatan video WaveSpeed sebelum membuat video.",
     "Video Encoder": "Encoder Video",
     "Default Video Encoder": "Default (Direkomendasikan)",
-    "Video Encoder Help": "Opsi lanjutan. Default mengikuti kebijakan encoder stabil aplikasi, saat ini libx264. Jika encoder perangkat keras tidak tersedia, aplikasi otomatis kembali ke libx264."
+    "Video Encoder Help": "Opsi lanjutan. Default mengikuti kebijakan encoder stabil aplikasi, saat ini libx264. Jika encoder perangkat keras tidak tersedia, aplikasi otomatis kembali ke libx264.",
+    "AI Image (Ken Burns)": "Gambar AI (Ken Burns Dinamis)",
+    "AI Image Provider": "Penyedia Gambar AI",
+    "Pollinations (Flux Free)": "Pollinations (Flux Gratis)",
+    "Google Gemini Image": "Gambar Google Gemini",
+    "Enable AI Image Fallback (Ken Burns)": "Aktifkan Fallback Gambar AI (Ken Burns)",
+    "AI Image Fallback Help": "Secara otomatis menghasilkan gambar AI dengan gerakan sinematik Ken Burns saat tidak ada video stok yang cocok."
   }
 }
