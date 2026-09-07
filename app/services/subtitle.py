@@ -8,6 +8,7 @@ try:
     from faster_whisper import WhisperModel
 except ImportError:
     WhisperModel = None
+from PIL import ImageColor
 from loguru import logger
 
 from app.config import config
@@ -28,15 +29,22 @@ class SubtitleWord:
 
 
 def hex_to_ass_color(color: str, alpha: int = 0) -> str:
-    """Convert hex color (#RRGGBB) to ASS color (&HAABBGGRR)."""
-    if isinstance(color, str) and color.startswith("#") and len(color) == 7:
+    """Convert hex (#RRGGBB) or named color to ASS color (&HAABBGGRR&)."""
+    if color and isinstance(color, str):
         try:
-            r = int(color[1:3], 16)
-            g = int(color[3:5], 16)
-            b = int(color[5:7], 16)
+            rgb = ImageColor.getrgb(color.strip())
+            r, g, b = rgb[0], rgb[1], rgb[2]
             return f"&H{alpha:02X}{b:02X}{g:02X}{r:02X}&"
-        except ValueError:
+        except Exception:
             pass
+        if color.startswith("#") and len(color) == 7:
+            try:
+                r = int(color[1:3], 16)
+                g = int(color[3:5], 16)
+                b = int(color[5:7], 16)
+                return f"&H{alpha:02X}{b:02X}{g:02X}{r:02X}&"
+            except ValueError:
+                pass
     return f"&H{alpha:02X}FFFFFF&"
 
 
@@ -243,6 +251,7 @@ def create(
         vad_parameters=dict(min_silence_duration_ms=500),
         **({"initial_prompt": initial_prompt} if initial_prompt else {}),
     )
+    segment_list = list(segments)
 
     detected_lang = getattr(info, "language", "") or "en"
     logger.info(
@@ -254,7 +263,7 @@ def create(
 
     if subtitle_style == "karaoke":
         words: list[SubtitleWord] = []
-        for segment in segments:
+        for segment in segment_list:
             if getattr(segment, "words", None):
                 for w in segment.words:
                     clean_w = w.word.strip()
@@ -266,29 +275,33 @@ def create(
                                 end=float(w.end),
                             )
                         )
-        _, srt_content = build_karaoke_subtitles(
-            words=words,
-            highlight_color=karaoke_highlight_color,
-            max_words=karaoke_max_words,
-            is_cjk_lang=is_cjk,
-        )
-        with open(subtitle_file, "w", encoding="utf-8") as f:
-            f.write(srt_content)
-        try:
-            ass_file = os.path.splitext(subtitle_file)[0] + ".ass"
-            write_ass_subtitles(
+        if words:
+            _, srt_content = build_karaoke_subtitles(
                 words=words,
-                ass_file=ass_file,
                 highlight_color=karaoke_highlight_color,
                 max_words=karaoke_max_words,
                 is_cjk_lang=is_cjk,
             )
-        except Exception as ass_err:
-            logger.debug(f"failed to export ASS subtitles: {ass_err}")
+            with open(subtitle_file, "w", encoding="utf-8") as f:
+                f.write(srt_content)
+            try:
+                ass_file = os.path.splitext(subtitle_file)[0] + ".ass"
+                write_ass_subtitles(
+                    words=words,
+                    ass_file=ass_file,
+                    highlight_color=karaoke_highlight_color,
+                    max_words=karaoke_max_words,
+                    is_cjk_lang=is_cjk,
+                )
+            except Exception as ass_err:
+                logger.debug(f"failed to export ASS subtitles: {ass_err}")
 
-        diff = timer() - start
-        logger.info(f"complete karaoke subtitles, elapsed: {diff:.2f} s")
-        return subtitle_file
+            diff = timer() - start
+            logger.info(f"complete karaoke subtitles, elapsed: {diff:.2f} s")
+            return subtitle_file
+        logger.warning(
+            "no word timestamps found from whisper, fallback to classic subtitle segmentation"
+        )
 
     subtitles = []
 
@@ -304,7 +317,7 @@ def create(
             {"msg": seg_text, "start_time": seg_start, "end_time": seg_end}
         )
 
-    for segment in segments:
+    for segment in segment_list:
         words_idx = 0
         words_len = len(segment.words) if getattr(segment, "words", None) else 0
 

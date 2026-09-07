@@ -296,6 +296,36 @@ class TestSubtitleService(unittest.TestCase):
             srt_text = srt_path.read_text(encoding="utf-8")
             self.assertIn('<font color="#FFDD00">Smart</font>', srt_text)
 
+    def test_hex_to_ass_color_supports_named_and_hex(self):
+        self.assertEqual(subtitle.hex_to_ass_color("#FFFFFF"), "&H00FFFFFF&")
+        self.assertEqual(subtitle.hex_to_ass_color("white"), "&H00FFFFFF&")
+        self.assertEqual(subtitle.hex_to_ass_color("black"), "&H00000000&")
+        self.assertEqual(subtitle.hex_to_ass_color("yellow"), "&H0000FFFF&")
+
+    def test_create_with_karaoke_style_falls_back_when_no_words(self):
+        """当 Whisper 返回的 segment 没有 word timestamps 时，应回退至经典模式生成有效字幕。"""
+        class _FakeWhisperModelNoWords:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def transcribe(self, audio_file, **kwargs):
+                segment = SimpleNamespace(start=0.0, end=1.5, words=[])
+                info = SimpleNamespace(language="en", language_probability=0.99)
+                return [segment], info
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            srt_path = Path(tmp_dir) / "output.srt"
+            with patch.object(subtitle, "model", None), patch.object(
+                subtitle, "WhisperModel", _FakeWhisperModelNoWords
+            ):
+                result = subtitle.create(
+                    audio_file="audio.mp3",
+                    subtitle_file=str(srt_path),
+                    subtitle_style="karaoke",
+                )
+            self.assertEqual(result, str(srt_path))
+            self.assertTrue(srt_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,7 +26,7 @@ from moviepy import (
     concatenate_videoclips,
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 from app.config import config
 from app.models import const
@@ -1054,13 +1054,20 @@ def wrap_text(text, max_width, font="Arial", fontsize=60):
 
 
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
-    # 字幕背景色来自 API/WebUI 参数，可能为空或格式不规范。这里统一只接受
-    # #RRGGBB 形式，非法值回退为黑色，避免 PIL 渲染阶段抛出异常中断任务。
-    if isinstance(color, str) and color.startswith("#") and len(color) == 7:
+    # 字幕颜色来自 API/WebUI 参数，支持 #RRGGBB 以及标准颜色名（如 white, yellow 等）。
+    # 非法值回退为黑色，避免 PIL 渲染阶段抛出异常中断任务。
+    if color and isinstance(color, str):
+        c_str = color.strip()
         try:
-            return (int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16))
-        except ValueError:
+            rgb = ImageColor.getrgb(c_str)
+            return (rgb[0], rgb[1], rgb[2])
+        except Exception:
             pass
+        if c_str.startswith("#") and len(c_str) == 7:
+            try:
+                return (int(c_str[1:3], 16), int(c_str[3:5], 16), int(c_str[5:7], 16))
+            except ValueError:
+                pass
     return (0, 0, 0)
 
 
@@ -1170,7 +1177,7 @@ def parse_karaoke_phrase(phrase: str, default_color: str = "#FFFFFF") -> list[tu
     Example:
         '<font color="#FFDD00">Hello</font> world' -> [('Hello', '#FFDD00'), ('world', '#FFFFFF')]
     """
-    pattern = re.compile(r'<font color="([^"]+)">([^<]+)</font>')
+    pattern = re.compile(r"""<font\s+color\s*=\s*['"]([^'"]+)['"]\s*>([^<]+)</font>""", re.IGNORECASE)
     tokens: list[tuple[str, str]] = []
     last_idx = 0
     for match in pattern.finditer(phrase):
@@ -1210,8 +1217,9 @@ def _render_karaoke_subtitle_clip(
     Renders word-highlighted karaoke subtitles onto a transparent ImageClip.
     Supports individual word colors, outline stroke, and optional rounded background.
     """
+    tokens = [(w.strip(), c) for w, c in tokens if w and w.strip()]
     if not tokens:
-        empty = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        empty = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
         return ImageClip(np.array(empty), transparent=True)
 
     font_size = max(12, int(font_size))
@@ -1232,12 +1240,22 @@ def _render_karaoke_subtitle_clip(
         for ch in full_text
     )
 
-    space_w = 0 if is_cjk_text else max(1, font.getbbox(" ")[2] - font.getbbox(" ")[0])
+    if is_cjk_text:
+        space_w = 0
+    elif hasattr(font, "getlength"):
+        measured_space = font.getlength(" ")
+        space_w = max(int(font_size * 0.25), int(round(measured_space)))
+    else:
+        bbox = font.getbbox(" ")
+        space_w = max(int(font_size * 0.25), bbox[2] - bbox[0])
 
     words_measured = []
     for word, color in tokens:
-        bbox = font.getbbox(word)
-        w = max(1, bbox[2] - bbox[0])
+        if hasattr(font, "getlength"):
+            w = max(1, int(round(font.getlength(word))))
+        else:
+            bbox = font.getbbox(word)
+            w = max(1, bbox[2] - bbox[0])
         words_measured.append((word, color, w))
 
     lines: list[list[tuple[str, str, int]]] = [[]]
@@ -1259,7 +1277,12 @@ def _render_karaoke_subtitle_clip(
         line_height = max(1, font_size)
 
     interline = int(font_size * 0.25)
-    line_count = len(lines)
+    valid_lines = [line for line in lines if line]
+    if not valid_lines:
+        empty = Image.new("RGBA", (2, 2), (0, 0, 0, 0))
+        return ImageClip(np.array(empty), transparent=True)
+
+    line_count = len(valid_lines)
     text_total_h = line_height * line_count + interline * (line_count - 1)
 
     pad_x = int(font_size * 0.45) if bg_color else int(font_size * 0.1)
@@ -1267,13 +1290,15 @@ def _render_karaoke_subtitle_clip(
     margin_stroke = int(stroke_width * 2)
 
     line_widths = [
-        sum(w for _, _, w in line) + space_w * (len(line) - 1)
-        for line in lines
+        sum(w for _, _, w in line) + space_w * max(0, len(line) - 1)
+        for line in valid_lines
     ]
     max_line_w = max(line_widths) if line_widths else 10
 
-    box_w = int(max_line_w + 2 * pad_x + 2 * margin_stroke)
-    box_h = int(text_total_h + 2 * pad_y + 2 * margin_stroke)
+    raw_box_w = int(max_line_w + 2 * pad_x + 2 * margin_stroke)
+    raw_box_h = int(text_total_h + 2 * pad_y + 2 * margin_stroke)
+    box_w = raw_box_w + (raw_box_w % 2)
+    box_h = raw_box_h + (raw_box_h % 2)
 
     img = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -1295,8 +1320,8 @@ def _render_karaoke_subtitle_clip(
             draw.rectangle(rect, fill=bg_fill)
 
     cur_y = pad_y + margin_stroke
-    for line in lines:
-        line_w = sum(w for _, _, w in line) + space_w * (len(line) - 1)
+    for line in valid_lines:
+        line_w = sum(w for _, _, w in line) + space_w * max(0, len(line) - 1)
         cur_x = (box_w - line_w) // 2
         for word, color, w in line:
             r, g, b = _hex_to_rgb(color)
@@ -1379,15 +1404,15 @@ def _create_watermark_clip(
             margin = max(0, int(margin))
             pos = (position or "top_right").lower().strip()
             if pos == "top_left":
-                coord = (margin, margin)
+                coord = (max(0, margin), max(0, margin))
             elif pos == "bottom_left":
-                coord = (margin, video_height - target_h - margin)
+                coord = (max(0, margin), max(0, video_height - target_h - margin))
             elif pos == "bottom_right":
-                coord = (video_width - target_w - margin, video_height - target_h - margin)
+                coord = (max(0, video_width - target_w - margin), max(0, video_height - target_h - margin))
             elif pos == "center":
-                coord = ((video_width - target_w) // 2, (video_height - target_h) // 2)
+                coord = (max(0, (video_width - target_w) // 2), max(0, (video_height - target_h) // 2))
             else:  # top_right
-                coord = (video_width - target_w - margin, margin)
+                coord = (max(0, video_width - target_w - margin), max(0, margin))
 
             return clip.with_position(coord)
     except Exception as exc:
@@ -1406,6 +1431,8 @@ def fit_clip_to_resolution(
     If aspect ratios match, resizes directly.
     Otherwise, scales to fit and centers on a black background ColorClip.
     """
+    target_width = target_width - (target_width % 2)
+    target_height = target_height - (target_height % 2)
     clip_w, clip_h = clip.size
     target_ratio = target_width / target_height
     clip_ratio = clip_w / clip_h
@@ -1417,8 +1444,10 @@ def fit_clip_to_resolution(
     else:
         scale_factor = target_height / clip_h
 
-    new_w = max(1, int(clip_w * scale_factor))
-    new_h = max(1, int(clip_h * scale_factor))
+    new_w = max(2, int(clip_w * scale_factor))
+    new_h = max(2, int(clip_h * scale_factor))
+    new_w = new_w - (new_w % 2)
+    new_h = new_h - (new_h % 2)
 
     background = ColorClip(
         size=(target_width, target_height), color=bg_color
@@ -1482,6 +1511,7 @@ def stitch_intro_outro(
             codec=codec,
             fps=fps,
             audio_codec="aac",
+            temp_audiofile_path=_get_temp_audio_dir(os.path.dirname(output_file) or "."),
             logger=None,
         )
         logger.info(
@@ -1547,7 +1577,7 @@ def generate_video(
             getattr(params, "rounded_subtitle_background", False) and bg_color
         )
 
-        if "<font color=" in phrase:
+        if re.search(r"<font\s+color\s*=", phrase, re.IGNORECASE):
             tokens = parse_karaoke_phrase(phrase, default_color=params.text_fore_color or "#FFFFFF")
             _clip = _render_karaoke_subtitle_clip(
                 tokens=tokens,
@@ -1777,6 +1807,7 @@ def generate_video(
             for item in sub.subtitles:
                 clip = create_text_clip(subtitle_item=item)
                 text_clips.append(clip)
+                clip_stack.callback(clip.close)
 
         composite_layers = [video_clip]
         if text_clips:

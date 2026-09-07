@@ -1402,27 +1402,39 @@ class TestVideoService(unittest.TestCase):
             [("Plain", "#E0E0E0"), ("text", "#E0E0E0"), ("phrase", "#E0E0E0")],
         )
 
+        # Single quotes and case variations
+        tokens4 = vd.parse_karaoke_phrase("<FONT COLOR='#00FFFF'>Cyan</FONT> text", default_color="#FFFFFF")
+        self.assertEqual(tokens4, [("Cyan", "#00FFFF"), ("text", "#FFFFFF")])
+
         # Empty phrase
         self.assertEqual(vd.parse_karaoke_phrase(""), [])
         self.assertEqual(vd.parse_karaoke_phrase("   "), [])
 
+    def test_hex_to_rgb_supports_named_and_hex_colors(self):
+        self.assertEqual(vd._hex_to_rgb("#FFFFFF"), (255, 255, 255))
+        self.assertEqual(vd._hex_to_rgb("white"), (255, 255, 255))
+        self.assertEqual(vd._hex_to_rgb("yellow"), (255, 255, 0))
+        self.assertEqual(vd._hex_to_rgb("black"), (0, 0, 0))
+        self.assertEqual(vd._hex_to_rgb("invalid_xyz"), (0, 0, 0))
+        self.assertEqual(vd._hex_to_rgb(""), (0, 0, 0))
+
     def test_render_karaoke_subtitle_clip(self):
-        # Empty tokens returns minimal transparent clip
+        # Empty tokens returns minimal transparent clip with even dimensions
         empty_clip = vd._render_karaoke_subtitle_clip([], font_path="", font_size=20)
         try:
-            self.assertEqual(empty_clip.w, 1)
-            self.assertEqual(empty_clip.h, 1)
+            self.assertEqual(empty_clip.w % 2, 0)
+            self.assertEqual(empty_clip.h % 2, 0)
         finally:
             empty_clip.close()
 
         # Valid tokens with styling and rounded background
         font_path = os.path.join(utils.font_dir(), "STHeitiMedium.ttc")
-        tokens = [("Hello", "#FFDD00"), ("World", "#FFFFFF")]
+        tokens = [("Hello", "#FFDD00"), ("World", "white")]
         clip = vd._render_karaoke_subtitle_clip(
             tokens=tokens,
             font_path=font_path,
             font_size=24,
-            stroke_color="#000000",
+            stroke_color="black",
             stroke_width=2,
             max_width=400,
             bg_color="#000000",
@@ -1431,6 +1443,8 @@ class TestVideoService(unittest.TestCase):
         try:
             self.assertGreater(clip.w, 10)
             self.assertGreater(clip.h, 10)
+            self.assertEqual(clip.w % 2, 0)
+            self.assertEqual(clip.h % 2, 0)
             self.assertIsNotNone(clip.mask)
         finally:
             clip.close()
@@ -1526,6 +1540,24 @@ class TestVideoService(unittest.TestCase):
                 self.assertEqual(clip_bl.pos(0), (10, 2000 - 50 - 10))
             finally:
                 clip_bl.close()
+
+            # Test large margin clamp to 0
+            clip_clamp = vd._create_watermark_clip(
+                watermark_path=tmp_img.name,
+                video_width=200,
+                video_height=200,
+                duration=1.0,
+                position="bottom_right",
+                scale=0.5,
+                margin=500,  # exceeds bounds
+            )
+            self.assertIsNotNone(clip_clamp)
+            try:
+                pos_clamp = clip_clamp.pos(0)
+                self.assertEqual(pos_clamp[0], 0)
+                self.assertEqual(pos_clamp[1], 0)
+            finally:
+                clip_clamp.close()
         finally:
             if os.path.exists(tmp_img.name):
                 os.remove(tmp_img.name)
@@ -1533,8 +1565,9 @@ class TestVideoService(unittest.TestCase):
     def test_fit_clip_to_resolution(self):
         clip = vd.ColorClip(size=(640, 360), color=(100, 100, 100)).with_duration(2.0)
         try:
-            fitted = vd.fit_clip_to_resolution(clip, target_width=1080, target_height=1920)
+            fitted = vd.fit_clip_to_resolution(clip, target_width=1081, target_height=1921)
             try:
+                # Odd targets must be rounded down to even
                 self.assertEqual(fitted.size, (1080, 1920))
                 self.assertEqual(fitted.duration, 2.0)
             finally:

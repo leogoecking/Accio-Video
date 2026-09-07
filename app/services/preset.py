@@ -6,6 +6,7 @@ import json
 import os
 import re
 from pathlib import Path
+from uuid import uuid4
 from loguru import logger
 
 from app.config import config
@@ -146,7 +147,10 @@ def save_brand_asset(category: str, filename: str, content: bytes) -> str:
             f"{category} file must be a video ({', '.join(sorted(SUPPORTED_VIDEO_EXTENSIONS))})"
         )
 
-    base_name = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", Path(filename).stem)[:40]
+    raw_stem = Path(filename).stem
+    base_name = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", raw_stem)[:40].strip("._")
+    if not base_name:
+        base_name = f"asset_{uuid4().hex[:8]}"
     safe_filename = f"{category}_{base_name}{ext}"
     brand_dir = get_brand_dir()
     target_path = os.path.join(brand_dir, safe_filename)

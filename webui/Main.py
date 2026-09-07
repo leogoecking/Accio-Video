@@ -5824,9 +5824,9 @@ def _render_brand_kit_settings(params):
                     except Exception as e:
                         st.error(str(e))
 
+            st.session_state.setdefault("watermark_path_input", "")
             watermark_path = st.text_input(
                 tr("Watermark File Path"),
-                value=st.session_state.get("watermark_path_input", ""),
                 key="watermark_path_input",
                 placeholder="storage/brand/watermark_logo.png",
             )
@@ -5856,21 +5856,21 @@ def _render_brand_kit_settings(params):
             )
             params.watermark_position = selected_pos
 
+            st.session_state.setdefault("watermark_opacity_slider", 80)
             opacity_val = st.slider(
                 tr("Watermark Opacity (%)"),
                 min_value=10,
                 max_value=100,
-                value=st.session_state.get("watermark_opacity_slider", 80),
                 step=5,
                 key="watermark_opacity_slider",
             )
             params.watermark_opacity = opacity_val / 100.0
 
+            st.session_state.setdefault("watermark_scale_slider", 15)
             scale_val = st.slider(
                 tr("Watermark Scale (% of width)"),
                 min_value=5,
                 max_value=50,
-                value=st.session_state.get("watermark_scale_slider", 15),
                 step=1,
                 key="watermark_scale_slider",
             )
@@ -5898,9 +5898,9 @@ def _render_brand_kit_settings(params):
                     except Exception as e:
                         st.error(str(e))
 
+            st.session_state.setdefault("intro_path_input", "")
             intro_path = st.text_input(
                 tr("Intro Video Path"),
-                value=st.session_state.get("intro_path_input", ""),
                 key="intro_path_input",
                 placeholder="storage/brand/intro_opening.mp4",
             )
@@ -5924,9 +5924,9 @@ def _render_brand_kit_settings(params):
                     except Exception as e:
                         st.error(str(e))
 
+            st.session_state.setdefault("outro_path_input", "")
             outro_path = st.text_input(
                 tr("Outro Video Path"),
-                value=st.session_state.get("outro_path_input", ""),
                 key="outro_path_input",
                 placeholder="storage/brand/outro_subscribe.mp4",
             )

@@ -125,6 +125,12 @@ class TestPresetService(unittest.TestCase):
         with self.assertRaises(ValueError):
             preset.save_brand_asset("unknown_category", "logo.png", b"bytes")
 
+    def test_save_brand_asset_non_ascii_filename(self):
+        saved = preset.save_brand_asset("watermark", "我的水印.png", b"img-data")
+        self.assertTrue(os.path.isfile(saved))
+        self.assertTrue(saved.endswith(".png"))
+        self.assertIn("watermark_asset_", os.path.basename(saved))
+
 
 if __name__ == "__main__":
     unittest.main()
