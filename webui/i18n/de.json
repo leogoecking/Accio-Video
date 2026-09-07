@@ -1,6 +1,7 @@
 {
   "Language": "Deutsch",
   "Translation": {
+    "Watermark Margin (px)": "Wasserzeichenabstand (px)",
     "Login Required": "Anmeldung erforderlich",
     "Please login to access settings": "Bitte melden Sie sich an, um auf die Einstellungen zuzugreifen",
     "Username": "Benutzername",

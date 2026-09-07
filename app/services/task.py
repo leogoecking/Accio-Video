@@ -1251,6 +1251,12 @@ def _run_pipeline(
     logger.info(f"start task: {task_id}, stop_at: {stop_at}")
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=5)
 
+    if stop_at == "video":
+        try:
+            params = params.model_copy(update=file_security.resolve_brand_paths(params))
+        except ValueError as exc:
+            return _mark_task_failed(task_id, "preflight", str(exc))
+
     # 只有完整成片流程需要视频配乐供应商。尽早阻止缺少 Key 的完整任务，避免
     # 先消耗 LLM、TTS 和素材服务额度；中间产物接口仍可独立使用。
     video_music_provider = _VIDEO_MUSIC_PROVIDERS.get(params.bgm_type)
@@ -1611,6 +1617,11 @@ def render_final_from_draft(
         else:
             subject = (draft.video_subject if draft else "") or "Video"
             params = VideoParams(video_subject=subject)
+
+    try:
+        params = params.model_copy(update=file_security.resolve_brand_paths(params))
+    except ValueError as exc:
+        return _mark_task_failed(task_id, "preflight", str(exc))
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=70)
 

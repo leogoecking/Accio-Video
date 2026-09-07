@@ -115,6 +115,15 @@ class TestPresetService(unittest.TestCase):
         self.assertIn(intro_path, all_assets)
         self.assertIn(outro_path, all_assets)
 
+    def test_repeated_upload_preserves_asset_referenced_by_preset(self):
+        first = preset.save_brand_asset("intro", "opening.mp4", b"original")
+        preset.save_preset("Channel", {"intro_path": first})
+        second = preset.save_brand_asset("intro", "opening.mp4", b"replacement")
+        self.assertNotEqual(first, second)
+        self.assertEqual(Path(first).read_bytes(), b"original")
+        self.assertEqual(Path(second).read_bytes(), b"replacement")
+        self.assertEqual(preset.load_preset("Channel")["intro_path"], first)
+
     def test_save_brand_asset_rejects_invalid_extension_or_category(self):
         with self.assertRaises(ValueError):
             preset.save_brand_asset("watermark", "malicious.exe", b"bytes")

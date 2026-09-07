@@ -146,8 +146,7 @@ class TestVideoControllerTasks(unittest.TestCase):
 
     def test_create_task_removes_state_when_queue_is_full(self):
         """队列已满时必须回滚刚创建的状态，并向调用方返回 429。"""
-        body = MagicMock()
-        body.model_dump.return_value = {"video_subject": "Coffee"}
+        body = video_controller.VideoParams(video_subject="Coffee")
 
         with (
             patch.object(video_controller.utils, "get_uuid", return_value="task-123"),
@@ -167,8 +166,7 @@ class TestVideoControllerTasks(unittest.TestCase):
 
     def test_create_task_removes_state_when_scheduler_fails(self):
         """调度器未能接管任务时，不能留下永远处于 processing 的状态。"""
-        body = MagicMock()
-        body.model_dump.return_value = {"video_subject": "Coffee"}
+        body = video_controller.VideoParams(video_subject="Coffee")
         scheduling_error = RuntimeError("can't start new thread")
         state = sm.MemoryState()
 
@@ -594,7 +592,10 @@ class TestVideoControllerFiles(unittest.TestCase):
                     )
                 )
                 self.assertEqual(res.status, 200)
-                self.assertIn("watermark_logo.png", res.data["file"])
+                asset = Path(res.data["file"])
+                self.assertTrue(asset.name.startswith("watermark_logo_"))
+                self.assertEqual(asset.suffix, ".png")
+                self.assertEqual(asset.read_bytes(), b"\x89PNG\r\nfake-bytes")
                 self.assertEqual(res.data["category"], "watermark")
 
 

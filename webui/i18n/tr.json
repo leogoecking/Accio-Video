@@ -1,6 +1,7 @@
 {
   "Language": "Türkçe",
   "Translation": {
+    "Watermark Margin (px)": "Filigran kenar boşluğu (px)",
     "Login Required": "Giriş Gerekli",
     "Please login to access settings": "Ayarlara erişmek için lütfen giriş yapın",
     "Username": "Kullanıcı Adı",

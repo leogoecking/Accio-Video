@@ -1535,6 +1535,7 @@ def generate_video(
     BGM 但加载、特效或混合失败时返回 False。即使 BGM 失败仍会继续输出只有
     旁白的视频，让任务编排层决定是否向用户展示降级警告。
     """
+    params = params.model_copy(update=file_security.resolve_brand_paths(params))
     aspect = VideoAspect(params.video_aspect)
     video_width, video_height = aspect.to_resolution()
 
@@ -1788,9 +1789,9 @@ def generate_video(
                 video_height=video_height,
                 duration=source_video_clip.duration,
                 position=getattr(params, "watermark_position", "top_right") or "top_right",
-                opacity=float(getattr(params, "watermark_opacity", 0.8) or 0.8),
-                scale=float(getattr(params, "watermark_scale", 0.15) or 0.15),
-                margin=int(getattr(params, "watermark_margin", 20) or 20),
+                opacity=float(params.watermark_opacity if params.watermark_opacity is not None else 0.8),
+                scale=float(params.watermark_scale if params.watermark_scale is not None else 0.15),
+                margin=int(params.watermark_margin if params.watermark_margin is not None else 20),
             )
             if watermark_clip:
                 clip_stack.callback(watermark_clip.close)

@@ -1,5 +1,29 @@
 import os
 
+from app.utils import utils
+
+
+def resolve_brand_paths(params) -> dict[str, str]:
+    """Resolve brand assets exclusively within storage/brand, including symlinks."""
+    brand_dir = utils.storage_dir("brand")
+    resolved = {}
+    for field in ("watermark_path", "intro_path", "outro_path"):
+        value = getattr(params, field, None)
+        if not value:
+            continue
+        # Accept upload responses, bare asset names and project-relative paths.
+        path = value
+        normalized = path.replace("\\", "/")
+        if normalized.startswith("storage/brand/"):
+            path = os.path.join(utils.root_dir(), normalized)
+        try:
+            resolved[field] = resolve_path_within_directory(brand_dir, path)
+        except ValueError:
+            raise ValueError(
+                f"{field} must reference an existing uploaded file in storage/brand"
+            ) from None
+    return resolved
+
 
 def resolve_path_within_directory(
     base_dir: str,

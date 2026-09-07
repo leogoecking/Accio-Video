@@ -1,6 +1,7 @@
 {
   "Language": "简体中文",
   "Translation": {
+    "Watermark Margin (px)": "水印边距（像素）",
     "Login Required": "需要登录",
     "Please login to access settings": "请登录后访问配置设置 (:gray[默认用户名: admin, 密码: admin, 您可以在 config.toml 中修改])",
     "Username": "用户名",

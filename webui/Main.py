@@ -1335,13 +1335,15 @@ def _apply_restored_params(params):
     _set_stable_widget_value(
         "watermark_position_select", params.get("watermark_position") or "top_right"
     )
+    opacity = params.get("watermark_opacity")
     st.session_state["watermark_opacity_slider"] = min(
-        100, max(10, int(float(params.get("watermark_opacity", 0.8) or 0.8) * 100))
+        100, max(0, int(float(0.8 if opacity is None else opacity) * 100))
     )
     st.session_state["watermark_scale_slider"] = min(
         50, max(5, int(float(params.get("watermark_scale", 0.15) or 0.15) * 100))
     )
-    st.session_state["watermark_margin_input"] = int(params.get("watermark_margin", 20) or 20)
+    margin = params.get("watermark_margin")
+    st.session_state["watermark_margin_input"] = max(0, int(20 if margin is None else margin))
     st.session_state["intro_path_input"] = params.get("intro_path") or ""
     st.session_state["outro_path_input"] = params.get("outro_path") or ""
 
@@ -5859,7 +5861,7 @@ def _render_brand_kit_settings(params):
             st.session_state.setdefault("watermark_opacity_slider", 80)
             opacity_val = st.slider(
                 tr("Watermark Opacity (%)"),
-                min_value=10,
+                min_value=0,
                 max_value=100,
                 step=5,
                 key="watermark_opacity_slider",
@@ -5875,6 +5877,14 @@ def _render_brand_kit_settings(params):
                 key="watermark_scale_slider",
             )
             params.watermark_scale = scale_val / 100.0
+
+            st.session_state.setdefault("watermark_margin_input", 20)
+            params.watermark_margin = st.number_input(
+                tr("Watermark Margin (px)"),
+                min_value=0,
+                step=1,
+                key="watermark_margin_input",
+            )
 
         st.divider()
 

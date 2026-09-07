@@ -1602,6 +1602,8 @@ class TestVideoService(unittest.TestCase):
             bgm_type="sonilo",
             watermark_path=tmp_img.name,
             watermark_position="top_right",
+            watermark_opacity=0,
+            watermark_margin=0,
         )
         source_video = _FakeMoviePyClip(duration=5)
         voice_source = _FakeMoviePyClip(duration=5)
@@ -1612,6 +1614,8 @@ class TestVideoService(unittest.TestCase):
 
         try:
             with (
+                patch.object(vd.utils, "storage_dir", return_value=os.path.dirname(tmp_img.name)),
+                patch.object(vd, "_create_watermark_clip", wraps=vd._create_watermark_clip) as watermark,
                 patch.object(vd, "_open_video_clip_quietly", return_value=source_video),
                 patch.object(vd, "AudioFileClip", side_effect=[voice_source, bgm_source]),
                 patch.object(vd, "CompositeAudioClip", return_value=mixed_audio),
@@ -1630,6 +1634,8 @@ class TestVideoService(unittest.TestCase):
                 self.assertTrue(result)
                 composite_video.assert_called()
                 writer.assert_called_once()
+                self.assertEqual(watermark.call_args.kwargs["opacity"], 0)
+                self.assertEqual(watermark.call_args.kwargs["margin"], 0)
         finally:
             if os.path.exists(tmp_img.name):
                 os.remove(tmp_img.name)

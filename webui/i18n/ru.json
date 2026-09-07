@@ -1,6 +1,7 @@
 {
   "Language": "Русский",
   "Translation": {
+    "Watermark Margin (px)": "Отступ водяного знака (пикс.)",
     "Login Required": "Требуется вход",
     "Please login to access settings": "Войдите, чтобы открыть настройки",
     "Username": "Имя пользователя",

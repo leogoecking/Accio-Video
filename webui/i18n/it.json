@@ -1,6 +1,7 @@
 {
   "Language": "Italiano",
   "Translation": {
+    "Watermark Margin (px)": "Margine della filigrana (px)",
     "Login Required": "Accesso richiesto",
     "Please login to access settings": "Effettua l'accesso per accedere alle impostazioni",
     "Username": "Nome utente",

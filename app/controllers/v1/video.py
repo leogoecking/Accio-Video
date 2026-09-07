@@ -207,6 +207,8 @@ def create_task(
     task_id = utils.get_uuid()
     request_id = base.get_task_id(request)
     try:
+        if stop_at == "video":
+            body = body.model_copy(update=file_security.resolve_brand_paths(body))
         task = {
             "task_id": task_id,
             "request_id": request_id,
@@ -575,5 +577,4 @@ async def upload_brand_asset(
     except Exception as e:
         logger.warning(f"failed to upload brand asset: {e}")
         raise HttpException(task_id=request_id, status_code=500, message=f"failed to upload brand asset: {str(e)}")
-
 

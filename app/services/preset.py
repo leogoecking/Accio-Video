@@ -151,13 +151,13 @@ def save_brand_asset(category: str, filename: str, content: bytes) -> str:
     base_name = re.sub(r"[^a-zA-Z0-9_\-\.]", "_", raw_stem)[:40].strip("._")
     if not base_name:
         base_name = f"asset_{uuid4().hex[:8]}"
-    safe_filename = f"{category}_{base_name}{ext}"
+    safe_filename = f"{category}_{base_name}_{uuid4().hex}{ext}"
     brand_dir = get_brand_dir()
     target_path = os.path.join(brand_dir, safe_filename)
     target_path = file_security.resolve_path_within_directory(
         brand_dir, target_path, require_file=False
     )
-    with open(target_path, "wb") as fp:
+    with open(target_path, "xb") as fp:
         fp.write(content)
     logger.info(f"saved brand asset ({category}) to {target_path}")
     return target_path

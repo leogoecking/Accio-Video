@@ -1,6 +1,7 @@
 {
   "Language": "Português",
   "Translation": {
+    "Watermark Margin (px)": "Margem da marca d'água (px)",
     "Login Required": "Login Necessário",
     "Please login to access settings": "Por favor, faça login para acessar as configurações",
     "Username": "Nome de usuário",
