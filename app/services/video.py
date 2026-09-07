@@ -6,6 +6,7 @@ import gc
 import subprocess
 import sys
 import re
+import shutil
 import tempfile
 import unicodedata
 from contextlib import ExitStack, redirect_stdout
@@ -22,6 +23,7 @@ from moviepy import (
     TextClip,
     VideoFileClip,
     afx,
+    concatenate_videoclips,
 )
 from moviepy.video.tools.subtitles import SubtitlesClip
 from PIL import Image, ImageDraw, ImageFont
@@ -1332,6 +1334,162 @@ def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     return _subtitle_font_supports_sample(font_path, sample)
 
 
+def _create_watermark_clip(
+    watermark_path: str,
+    video_width: int,
+    video_height: int,
+    duration: float,
+    position: str = "top_right",
+    opacity: float = 0.8,
+    scale: float = 0.15,
+    margin: int = 20,
+) -> ImageClip | None:
+    """
+    Creates a watermark ImageClip from an image file (PNG/JPG/WebP).
+    Resizes maintaining aspect ratio according to `scale` (fraction of video width),
+    applies `opacity`, and positions it according to `position` and `margin`.
+    """
+    if not watermark_path or not os.path.isfile(watermark_path):
+        return None
+
+    try:
+        with Image.open(watermark_path) as orig_img:
+            img = orig_img.convert("RGBA")
+            orig_w, orig_h = img.size
+            if orig_w <= 0 or orig_h <= 0:
+                return None
+
+            scale = max(0.01, min(1.0, float(scale)))
+            target_w = max(10, int(video_width * scale))
+            aspect_ratio = orig_h / orig_w
+            target_h = max(10, int(target_w * aspect_ratio))
+
+            img = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+            opacity = max(0.0, min(1.0, float(opacity)))
+            if opacity < 1.0:
+                r, g, b, a = img.split()
+                a = a.point(lambda p: int(p * opacity))
+                img = Image.merge("RGBA", (r, g, b, a))
+
+            img_array = np.array(img)
+            clip = ImageClip(img_array, transparent=True)
+            clip = clip.with_duration(duration)
+
+            margin = max(0, int(margin))
+            pos = (position or "top_right").lower().strip()
+            if pos == "top_left":
+                coord = (margin, margin)
+            elif pos == "bottom_left":
+                coord = (margin, video_height - target_h - margin)
+            elif pos == "bottom_right":
+                coord = (video_width - target_w - margin, video_height - target_h - margin)
+            elif pos == "center":
+                coord = ((video_width - target_w) // 2, (video_height - target_h) // 2)
+            else:  # top_right
+                coord = (video_width - target_w - margin, margin)
+
+            return clip.with_position(coord)
+    except Exception as exc:
+        logger.warning(f"failed to load watermark image {watermark_path}: {exc}")
+        return None
+
+
+def fit_clip_to_resolution(
+    clip,
+    target_width: int,
+    target_height: int,
+    bg_color: tuple[int, int, int] = (0, 0, 0),
+):
+    """
+    Fits a video clip into (target_width, target_height).
+    If aspect ratios match, resizes directly.
+    Otherwise, scales to fit and centers on a black background ColorClip.
+    """
+    clip_w, clip_h = clip.size
+    target_ratio = target_width / target_height
+    clip_ratio = clip_w / clip_h
+    if abs(clip_ratio - target_ratio) < 1e-3:
+        return clip.resized(new_size=(target_width, target_height))
+
+    if clip_ratio > target_ratio:
+        scale_factor = target_width / clip_w
+    else:
+        scale_factor = target_height / clip_h
+
+    new_w = max(1, int(clip_w * scale_factor))
+    new_h = max(1, int(clip_h * scale_factor))
+
+    background = ColorClip(
+        size=(target_width, target_height), color=bg_color
+    ).with_duration(clip.duration)
+    resized_content = clip.resized(new_size=(new_w, new_h)).with_position("center")
+    return CompositeVideoClip([background, resized_content])
+
+
+def stitch_intro_outro(
+    main_video_path: str,
+    output_file: str,
+    intro_path: str | None = None,
+    outro_path: str | None = None,
+    target_width: int = 1080,
+    target_height: int = 1920,
+    fps: int = 30,
+) -> bool:
+    """
+    Stitches optional intro and outro video clips with the main video clip.
+    Handles aspect ratio adaptation and clean resource management.
+    """
+    has_intro = bool(intro_path and os.path.isfile(intro_path))
+    has_outro = bool(outro_path and os.path.isfile(outro_path))
+
+    if not has_intro and not has_outro:
+        if main_video_path != output_file:
+            shutil.copy2(main_video_path, output_file)
+        return True
+
+    with ExitStack() as stack:
+        clips_to_concat = []
+
+        if has_intro:
+            intro_raw = stack.enter_context(VideoFileClip(intro_path))
+            intro_fitted = stack.enter_context(
+                fit_clip_to_resolution(intro_raw, target_width, target_height)
+            )
+            clips_to_concat.append(intro_fitted)
+
+        main_raw = stack.enter_context(VideoFileClip(main_video_path))
+        main_fitted = stack.enter_context(
+            fit_clip_to_resolution(main_raw, target_width, target_height)
+        )
+        clips_to_concat.append(main_fitted)
+
+        if has_outro:
+            outro_raw = stack.enter_context(VideoFileClip(outro_path))
+            outro_fitted = stack.enter_context(
+                fit_clip_to_resolution(outro_raw, target_width, target_height)
+            )
+            clips_to_concat.append(outro_fitted)
+
+        concatenated = stack.enter_context(
+            concatenate_videoclips(clips_to_concat, method="compose")
+        )
+
+        codec = _get_effective_video_codec()
+        _write_videofile_with_codec_fallback(
+            concatenated,
+            output_file,
+            codec=codec,
+            fps=fps,
+            audio_codec="aac",
+            logger=None,
+        )
+        logger.info(
+            f"stitched intro/outro: intro={has_intro}, outro={has_outro} => {output_file}"
+        )
+        return True
+
+
 def generate_video(
     video_path: str,
     audio_path: str,
@@ -1591,6 +1749,23 @@ def generate_video(
                 font_size=params.font_size,
             )
 
+        watermark_clip = None
+        watermark_path = getattr(params, "watermark_path", "")
+        if watermark_path and os.path.isfile(watermark_path):
+            watermark_clip = _create_watermark_clip(
+                watermark_path=watermark_path,
+                video_width=video_width,
+                video_height=video_height,
+                duration=source_video_clip.duration,
+                position=getattr(params, "watermark_position", "top_right") or "top_right",
+                opacity=float(getattr(params, "watermark_opacity", 0.8) or 0.8),
+                scale=float(getattr(params, "watermark_scale", 0.15) or 0.15),
+                margin=int(getattr(params, "watermark_margin", 20) or 20),
+            )
+            if watermark_clip:
+                clip_stack.callback(watermark_clip.close)
+
+        text_clips = []
         if subtitle_path and os.path.exists(subtitle_path):
             sub = clip_stack.enter_context(
                 SubtitlesClip(
@@ -1599,11 +1774,18 @@ def generate_video(
                     make_textclip=make_textclip,
                 )
             )
-            text_clips = []
             for item in sub.subtitles:
                 clip = create_text_clip(subtitle_item=item)
                 text_clips.append(clip)
-            video_clip = CompositeVideoClip([video_clip, *text_clips])
+
+        composite_layers = [video_clip]
+        if text_clips:
+            composite_layers.extend(text_clips)
+        if watermark_clip:
+            composite_layers.append(watermark_clip)
+
+        if len(composite_layers) > 1:
+            video_clip = CompositeVideoClip(composite_layers)
             clip_stack.callback(video_clip.close)
 
         bgm_enabled = bgm_service.should_use_bgm(
@@ -1658,9 +1840,23 @@ def generate_video(
         # 显式沿用输入音频的采样率；如果取不到，再回退 MoviePy 默认的 44100Hz。
         # 这样可以减少不同环境，尤其 Docker 中再次重采样带来的音质波动。
         output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
+
+        intro_path = getattr(params, "intro_path", "")
+        outro_path = getattr(params, "outro_path", "")
+        has_intro = bool(intro_path and os.path.isfile(intro_path))
+        has_outro = bool(outro_path and os.path.isfile(outro_path))
+
+        target_render_output = output_file
+        temp_main_file = None
+        if has_intro or has_outro:
+            temp_main_file = os.path.join(
+                output_dir, f"temp-main-{os.path.basename(output_file)}"
+            )
+            target_render_output = temp_main_file
+
         _write_videofile_with_codec_fallback(
             final_video_clip,
-            output_file=output_file,
+            output_file=target_render_output,
             codec=_get_configured_video_codec(),
             audio_codec=audio_codec,
             audio_fps=output_audio_fps,
@@ -1670,6 +1866,24 @@ def generate_video(
             logger=None,
             fps=fps,
         )
+
+        if (has_intro or has_outro) and temp_main_file:
+            try:
+                stitch_intro_outro(
+                    main_video_path=temp_main_file,
+                    output_file=output_file,
+                    intro_path=intro_path if has_intro else None,
+                    outro_path=outro_path if has_outro else None,
+                    target_width=video_width,
+                    target_height=video_height,
+                    fps=fps,
+                )
+            finally:
+                if temp_main_file and os.path.exists(temp_main_file):
+                    try:
+                        os.remove(temp_main_file)
+                    except Exception as exc:
+                        logger.warning(f"failed to remove temp main file: {exc}")
         return bgm_mix_succeeded
 
 

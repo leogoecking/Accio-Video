@@ -132,6 +132,15 @@ class VideoParams(BaseModel):
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
 
+    # Brand Kit: Watermark & Intro / Outro
+    watermark_path: Optional[str] = ""
+    watermark_position: Optional[str] = "top_right"  # top_left, top_right, bottom_left, bottom_right, center
+    watermark_opacity: Optional[float] = 0.8
+    watermark_scale: Optional[float] = 0.15
+    watermark_margin: Optional[int] = 20
+    intro_path: Optional[str] = ""
+    outro_path: Optional[str] = ""
+
 
 class SubtitleRequest(BaseModel):
     video_script: str
@@ -538,3 +547,15 @@ class VideoMaterialUploadResponse(BaseResponse):
             },
         }
     )
+
+
+class PresetListResponse(BaseResponse):
+    data: List[str] = []
+
+
+class PresetResponse(BaseResponse):
+    data: dict = {}
+
+
+class BrandAssetUploadResponse(BaseResponse):
+    data: dict = {}

@@ -18,8 +18,12 @@ from app.controllers.v1.base import new_router
 from app.models.exception import HttpException
 from app.models.schema import (
     AudioRequest,
+    BaseResponse,
     BgmRetrieveResponse,
     BgmUploadResponse,
+    BrandAssetUploadResponse,
+    PresetListResponse,
+    PresetResponse,
     SubtitleRequest,
     TaskDeletionResponse,
     TaskListResponse,
@@ -28,10 +32,12 @@ from app.models.schema import (
     TaskResponse,
     TaskVideoRequest,
     VideoMaterialUploadResponse,
-    VideoMaterialRetrieveResponse
+    VideoMaterialRetrieveResponse,
+    VideoParams,
 )
 from app.services import bgm as bgm_service
 from app.services import material_upload as material_upload_service
+from app.services import preset as preset_service
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import file_security, utils
@@ -502,3 +508,72 @@ async def download_video(request: Request, file_path: str):
         filename=f"{filename}{extension}",
         media_type=f"video/{extension[1:]}",
     )
+
+
+@router.get("/presets", response_model=PresetListResponse)
+def list_presets():
+    """List all available named presets."""
+    presets = preset_service.list_presets()
+    return PresetListResponse(status=200, message="success", data=presets)
+
+
+@router.get("/presets/{name}", response_model=PresetResponse)
+def get_preset(request: Request, name: str):
+    """Get preset parameters by name."""
+    request_id = base.get_task_id(request)
+    try:
+        data = preset_service.load_preset(name)
+        return PresetResponse(status=200, message="success", data=data)
+    except FileNotFoundError:
+        raise HttpException(task_id=request_id, status_code=404, message=f"preset '{name}' not found")
+    except ValueError as e:
+        raise HttpException(task_id=request_id, status_code=400, message=str(e))
+
+
+@router.post("/presets/{name}", response_model=PresetResponse)
+def save_preset(request: Request, name: str, params: VideoParams):
+    """Save current video parameters under a preset name."""
+    request_id = base.get_task_id(request)
+    try:
+        saved = preset_service.save_preset(name, params)
+        return PresetResponse(status=200, message="success", data=saved)
+    except ValueError as e:
+        raise HttpException(task_id=request_id, status_code=400, message=str(e))
+
+
+@router.delete("/presets/{name}", response_model=BaseResponse)
+def delete_preset(request: Request, name: str):
+    """Delete a named preset."""
+    request_id = base.get_task_id(request)
+    try:
+        deleted = preset_service.delete_preset(name)
+        if not deleted:
+            raise HttpException(task_id=request_id, status_code=404, message=f"preset '{name}' not found")
+        return BaseResponse(status=200, message="success")
+    except ValueError as e:
+        raise HttpException(task_id=request_id, status_code=400, message=str(e))
+
+
+@router.post("/brand/upload", response_model=BrandAssetUploadResponse)
+async def upload_brand_asset(
+    request: Request,
+    category: str = Query(..., pattern="^(watermark|intro|outro)$"),
+    file: UploadFile = File(...),
+):
+    """Upload a brand asset (watermark logo, intro, or outro video)."""
+    request_id = base.get_task_id(request)
+    try:
+        content = await file.read()
+        saved_path = preset_service.save_brand_asset(category, file.filename, content)
+        return BrandAssetUploadResponse(
+            status=200,
+            message="success",
+            data={"file": saved_path, "filename": file.filename, "category": category},
+        )
+    except ValueError as e:
+        raise HttpException(task_id=request_id, status_code=400, message=str(e))
+    except Exception as e:
+        logger.warning(f"failed to upload brand asset: {e}")
+        raise HttpException(task_id=request_id, status_code=500, message=f"failed to upload brand asset: {str(e)}")
+
+

@@ -1481,6 +1481,126 @@ class TestVideoService(unittest.TestCase):
         finally:
             cjk_clip.close()
 
+    def test_create_watermark_clip(self):
+        # Non-existent file returns None
+        self.assertIsNone(vd._create_watermark_clip("/non/existent.png", 1080, 1920, 5.0))
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
+            img = vd.Image.new("RGBA", (200, 100), (255, 0, 0, 255))
+            img.save(tmp_img.name)
+
+        try:
+            # Test scale, opacity, and positioning
+            clip = vd._create_watermark_clip(
+                watermark_path=tmp_img.name,
+                video_width=1000,
+                video_height=2000,
+                duration=4.5,
+                position="top_right",
+                opacity=0.7,
+                scale=0.20,
+                margin=25,
+            )
+            self.assertIsNotNone(clip)
+            try:
+                self.assertEqual(clip.duration, 4.5)
+                self.assertEqual(clip.w, 200)  # 20% of 1000
+                self.assertEqual(clip.h, 100)  # 200 * (100/200) = 100
+                pos = clip.pos(0)
+                self.assertEqual(pos, (1000 - 200 - 25, 25))
+            finally:
+                clip.close()
+
+            # Test bottom_left position
+            clip_bl = vd._create_watermark_clip(
+                watermark_path=tmp_img.name,
+                video_width=1000,
+                video_height=2000,
+                duration=2.0,
+                position="bottom_left",
+                scale=0.10,
+                margin=10,
+            )
+            self.assertIsNotNone(clip_bl)
+            try:
+                self.assertEqual(clip_bl.pos(0), (10, 2000 - 50 - 10))
+            finally:
+                clip_bl.close()
+        finally:
+            if os.path.exists(tmp_img.name):
+                os.remove(tmp_img.name)
+
+    def test_fit_clip_to_resolution(self):
+        clip = vd.ColorClip(size=(640, 360), color=(100, 100, 100)).with_duration(2.0)
+        try:
+            fitted = vd.fit_clip_to_resolution(clip, target_width=1080, target_height=1920)
+            try:
+                self.assertEqual(fitted.size, (1080, 1920))
+                self.assertEqual(fitted.duration, 2.0)
+            finally:
+                fitted.close()
+        finally:
+            clip.close()
+
+    def test_stitch_intro_outro_noop_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            main_path = os.path.join(tmp_dir, "main.mp4")
+            output_path = os.path.join(tmp_dir, "output.mp4")
+            Path(main_path).write_bytes(b"main-video-bytes")
+
+            result = vd.stitch_intro_outro(
+                main_video_path=main_path,
+                output_file=output_path,
+                intro_path=None,
+                outro_path="",
+            )
+            self.assertTrue(result)
+            self.assertTrue(os.path.isfile(output_path))
+            self.assertEqual(Path(output_path).read_bytes(), b"main-video-bytes")
+
+    def test_generate_video_composites_watermark(self):
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
+            img = vd.Image.new("RGBA", (50, 50), (255, 255, 255, 255))
+            img.save(tmp_img.name)
+
+        params = vd.VideoParams(
+            video_subject="test",
+            subtitle_enabled=False,
+            bgm_type="sonilo",
+            watermark_path=tmp_img.name,
+            watermark_position="top_right",
+        )
+        source_video = _FakeMoviePyClip(duration=5)
+        voice_source = _FakeMoviePyClip(duration=5)
+        bgm_source = _FakeMoviePyClip(duration=5)
+        mixed_audio = _FakeMoviePyClip(fps=44100)
+        final_video = _FakeMoviePyClip(duration=5)
+        source_video.with_audio_result = final_video
+
+        try:
+            with (
+                patch.object(vd, "_open_video_clip_quietly", return_value=source_video),
+                patch.object(vd, "AudioFileClip", side_effect=[voice_source, bgm_source]),
+                patch.object(vd, "CompositeAudioClip", return_value=mixed_audio),
+                patch.object(vd, "CompositeVideoClip", return_value=source_video) as composite_video,
+                patch.object(vd, "_write_videofile_with_codec_fallback") as writer,
+                patch.object(vd, "_get_configured_video_codec", return_value="libx264"),
+            ):
+                result = vd.generate_video(
+                    video_path="combined.mp4",
+                    audio_path="voice.mp3",
+                    subtitle_path="",
+                    output_file="final.mp4",
+                    params=params,
+                    bgm_file_override="sonilo.m4a",
+                )
+                self.assertTrue(result)
+                composite_video.assert_called()
+                writer.assert_called_once()
+        finally:
+            if os.path.exists(tmp_img.name):
+                os.remove(tmp_img.name)
+
 
 class TestMaterialResolutionTolerance(unittest.TestCase):
     def test_accepts_material_at_the_nominal_minimum(self):

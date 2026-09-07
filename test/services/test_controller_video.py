@@ -540,6 +540,63 @@ class TestVideoControllerFiles(unittest.TestCase):
         self.assertEqual(response.filename, "final-1.mp4")
         self.assertEqual(response.media_type, "video/mp4")
 
+    def test_preset_endpoints(self):
+        req = self._request()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(video_controller.preset_service, "get_preset_dir", return_value=temp_dir):
+                # 1. List presets (starts empty or default)
+                list_res = video_controller.list_presets()
+                self.assertEqual(list_res.status, 200)
+
+                # 2. Save preset
+                params = video_controller.VideoParams(
+                    video_subject="Test Channel",
+                    video_aspect="9:16",
+                    watermark_path="/path/logo.png",
+                )
+                save_res = video_controller.save_preset(req, "My_Preset", params)
+                self.assertEqual(save_res.status, 200)
+
+                # 3. Get preset
+                get_res = video_controller.get_preset(req, "My_Preset")
+                self.assertEqual(get_res.status, 200)
+                self.assertEqual(get_res.data["video_aspect"], "9:16")
+                self.assertEqual(get_res.data["watermark_path"], "/path/logo.png")
+
+                # 4. Get non-existent preset raises 404
+                with self.assertRaises(HttpException) as ctx:
+                    video_controller.get_preset(req, "Missing_Preset")
+                self.assertEqual(ctx.exception.status_code, 404)
+
+                # 5. Delete preset
+                del_res = video_controller.delete_preset(req, "My_Preset")
+                self.assertEqual(del_res.status, 200)
+
+                # 6. Delete again raises 404
+                with self.assertRaises(HttpException) as ctx:
+                    video_controller.delete_preset(req, "My_Preset")
+                self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_upload_brand_asset_endpoint(self):
+        req = self._request()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(video_controller.preset_service, "get_brand_dir", return_value=temp_dir):
+                async def fake_read():
+                    return b"\x89PNG\r\nfake-bytes"
+
+                fake_file = SimpleNamespace(
+                    filename="logo.png",
+                    read=fake_read,
+                )
+                res = asyncio.run(
+                    video_controller.upload_brand_asset(
+                        request=req, category="watermark", file=fake_file
+                    )
+                )
+                self.assertEqual(res.status, 200)
+                self.assertIn("watermark_logo.png", res.data["file"])
+                self.assertEqual(res.data["category"], "watermark")
+
 
 if __name__ == "__main__":
     unittest.main()

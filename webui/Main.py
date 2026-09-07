@@ -52,6 +52,7 @@ from app.services import (
     webui_task,
 )
 from app.services import elevenlabs_music as elevenlabs_music_service
+from app.services import preset as preset_service
 from app.services import sonilo as sonilo_service
 from app.services import state as sm
 from app.services import task as tm
@@ -1329,6 +1330,21 @@ def _apply_restored_params(params):
         6, max(1, int(params.get("karaoke_max_words", 3)))
     )
 
+    # Brand Kit: Watermark & Intro / Outro
+    st.session_state["watermark_path_input"] = params.get("watermark_path") or ""
+    _set_stable_widget_value(
+        "watermark_position_select", params.get("watermark_position") or "top_right"
+    )
+    st.session_state["watermark_opacity_slider"] = min(
+        100, max(10, int(float(params.get("watermark_opacity", 0.8) or 0.8) * 100))
+    )
+    st.session_state["watermark_scale_slider"] = min(
+        50, max(5, int(float(params.get("watermark_scale", 0.15) or 0.15) * 100))
+    )
+    st.session_state["watermark_margin_input"] = int(params.get("watermark_margin", 20) or 20)
+    st.session_state["intro_path_input"] = params.get("intro_path") or ""
+    st.session_state["outro_path_input"] = params.get("outro_path") or ""
+
     st.session_state.pop("local_video_materials_uploader", None)
     # 历史任务只保存素材路径，不能保证这些文件在当前环境仍然存在。
     # 同时清空当前页面已缓存的上传素材，避免恢复后误用另一个任务的文件。
@@ -2504,9 +2520,89 @@ def _apply_pending_settings_preset():
 
 
 def _render_settings_transfer(params):
-    """渲染生成参数预设的导出与导入入口。"""
-    with st.expander(tr("Settings Preset"), expanded=False):
+    """渲染生成参数预设与 Brand Kit 的管理、导出与导入入口。"""
+    with st.expander(tr("Settings Preset & Brand Kits"), expanded=False):
         st.caption(tr("Settings Preset Help"))
+
+        # --- Named Presets Section ---
+        st.markdown(f"##### {tr('Named Presets')}")
+        available_presets = preset_service.list_presets()
+        preset_options = [f"-- {tr('Select Preset')} --"] + available_presets
+
+        preset_col1, preset_col2, preset_col3 = st.columns([3, 1.5, 1.5])
+        with preset_col1:
+            selected_preset = st.selectbox(
+                tr("Saved Presets"),
+                options=preset_options,
+                key="saved_presets_selectbox",
+                label_visibility="collapsed",
+            )
+
+        with preset_col2:
+            can_act = selected_preset and not selected_preset.startswith("--")
+            if st.button(
+                tr("Load Preset"),
+                key="load_named_preset_btn",
+                use_container_width=True,
+                disabled=not can_act,
+                icon=":material/folder_open:",
+            ):
+                try:
+                    loaded = preset_service.load_preset(selected_preset)
+                    st.session_state["settings_preset_payload"] = loaded
+                    st.toast(f"{tr('Preset Loaded')}: {selected_preset}")
+                    st.rerun()
+                except Exception as exc:
+                    logger.warning(f"failed to load preset '{selected_preset}': {exc}")
+                    st.error(tr("Settings Preset Import Failed"))
+
+        with preset_col3:
+            if st.button(
+                tr("Delete Preset"),
+                key="delete_named_preset_btn",
+                use_container_width=True,
+                disabled=not can_act,
+                icon=":material/delete:",
+            ):
+                try:
+                    preset_service.delete_preset(selected_preset)
+                    st.toast(f"{tr('Preset Deleted')}: {selected_preset}")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+        save_col1, save_col2 = st.columns([4, 2])
+        with save_col1:
+            new_preset_name = st.text_input(
+                tr("Preset Name"),
+                placeholder="Finance Reels, Dark Motivation...",
+                key="new_preset_name_input",
+                label_visibility="collapsed",
+            )
+        with save_col2:
+            if st.button(
+                tr("Save as Preset"),
+                key="save_named_preset_btn",
+                use_container_width=True,
+                icon=":material/save:",
+            ):
+                if not new_preset_name or not new_preset_name.strip():
+                    st.warning(tr("Please enter a preset name"))
+                else:
+                    try:
+                        preset_service.save_preset(new_preset_name.strip(), params)
+                        st.toast(f"{tr('Preset Saved')}: {new_preset_name.strip()}")
+                        st.rerun()
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    except Exception as exc:
+                        logger.warning(f"failed to save preset: {exc}")
+                        st.error(f"{tr('Failed to save preset')}: {exc}")
+
+        st.divider()
+
+        # --- File Export / Import Section ---
+        st.markdown(f"##### {tr('Preset File Transfer')}")
         preset_payload = _build_settings_preset_payload(
             params.model_dump(mode="json"), config.project_version
         )
@@ -2543,6 +2639,7 @@ def _render_settings_transfer(params):
 
         st.session_state["settings_preset_payload"] = preset_params
         st.rerun()
+
 
 
 def _render_key_backup_settings(panel):
@@ -5702,6 +5799,140 @@ def _render_subtitle_settings(panel, params):
                 st.toast(tr("Default Subtitle Settings Restored"))
 
 
+def _render_brand_kit_settings(params):
+    """渲染 Brand Kit 设置（水印 Logo 与片头/片尾视频）。"""
+    with st.expander(tr("Brand Kit (Watermark & Intro/Outro)"), expanded=False):
+        st.caption(tr("Brand Kit Help"))
+
+        st.markdown(f"##### {tr('Watermark / Logo')}")
+        wm_col1, wm_col2 = st.columns([1, 1])
+        with wm_col1:
+            uploaded_logo = st.file_uploader(
+                tr("Upload Watermark Image"),
+                type=["png", "jpg", "jpeg", "webp"],
+                key="brand_watermark_uploader",
+            )
+            if uploaded_logo is not None:
+                if st.session_state.get("watermark_uploader_id") != uploaded_logo.file_id:
+                    st.session_state["watermark_uploader_id"] = uploaded_logo.file_id
+                    try:
+                        saved_wm = preset_service.save_brand_asset(
+                            "watermark", uploaded_logo.name, uploaded_logo.getvalue()
+                        )
+                        st.session_state["watermark_path_input"] = saved_wm
+                        st.toast(tr("Watermark uploaded successfully"))
+                    except Exception as e:
+                        st.error(str(e))
+
+            watermark_path = st.text_input(
+                tr("Watermark File Path"),
+                value=st.session_state.get("watermark_path_input", ""),
+                key="watermark_path_input",
+                placeholder="storage/brand/watermark_logo.png",
+            )
+            params.watermark_path = watermark_path.strip()
+
+        with wm_col2:
+            position_options = [
+                ("top_right", tr("Top Right")),
+                ("top_left", tr("Top Left")),
+                ("bottom_right", tr("Bottom Right")),
+                ("bottom_left", tr("Bottom Left")),
+                ("center", tr("Center")),
+            ]
+            current_pos = st.session_state.get("watermark_position_select", "top_right")
+            pos_index = 0
+            for idx, (code, _) in enumerate(position_options):
+                if code == current_pos:
+                    pos_index = idx
+                    break
+
+            selected_pos = st.selectbox(
+                tr("Watermark Position"),
+                options=[code for code, _ in position_options],
+                format_func=lambda code: next((label for c, label in position_options if c == code), code),
+                index=pos_index,
+                key="watermark_position_select",
+            )
+            params.watermark_position = selected_pos
+
+            opacity_val = st.slider(
+                tr("Watermark Opacity (%)"),
+                min_value=10,
+                max_value=100,
+                value=st.session_state.get("watermark_opacity_slider", 80),
+                step=5,
+                key="watermark_opacity_slider",
+            )
+            params.watermark_opacity = opacity_val / 100.0
+
+            scale_val = st.slider(
+                tr("Watermark Scale (% of width)"),
+                min_value=5,
+                max_value=50,
+                value=st.session_state.get("watermark_scale_slider", 15),
+                step=1,
+                key="watermark_scale_slider",
+            )
+            params.watermark_scale = scale_val / 100.0
+
+        st.divider()
+
+        st.markdown(f"##### {tr('Intro & Outro (Vignettes)')}")
+        intro_col, outro_col = st.columns(2)
+        with intro_col:
+            uploaded_intro = st.file_uploader(
+                tr("Upload Intro Video"),
+                type=["mp4", "mov", "mkv", "webm"],
+                key="brand_intro_uploader",
+            )
+            if uploaded_intro is not None:
+                if st.session_state.get("intro_uploader_id") != uploaded_intro.file_id:
+                    st.session_state["intro_uploader_id"] = uploaded_intro.file_id
+                    try:
+                        saved_intro = preset_service.save_brand_asset(
+                            "intro", uploaded_intro.name, uploaded_intro.getvalue()
+                        )
+                        st.session_state["intro_path_input"] = saved_intro
+                        st.toast(tr("Intro video uploaded successfully"))
+                    except Exception as e:
+                        st.error(str(e))
+
+            intro_path = st.text_input(
+                tr("Intro Video Path"),
+                value=st.session_state.get("intro_path_input", ""),
+                key="intro_path_input",
+                placeholder="storage/brand/intro_opening.mp4",
+            )
+            params.intro_path = intro_path.strip()
+
+        with outro_col:
+            uploaded_outro = st.file_uploader(
+                tr("Upload Outro Video"),
+                type=["mp4", "mov", "mkv", "webm"],
+                key="brand_outro_uploader",
+            )
+            if uploaded_outro is not None:
+                if st.session_state.get("outro_uploader_id") != uploaded_outro.file_id:
+                    st.session_state["outro_uploader_id"] = uploaded_outro.file_id
+                    try:
+                        saved_outro = preset_service.save_brand_asset(
+                            "outro", uploaded_outro.name, uploaded_outro.getvalue()
+                        )
+                        st.session_state["outro_path_input"] = saved_outro
+                        st.toast(tr("Outro video uploaded successfully"))
+                    except Exception as e:
+                        st.error(str(e))
+
+            outro_path = st.text_input(
+                tr("Outro Video Path"),
+                value=st.session_state.get("outro_path_input", ""),
+                key="outro_path_input",
+                placeholder="storage/brand/outro_subscribe.mp4",
+            )
+            params.outro_path = outro_path.strip()
+
+
 def _render_generation_controls(
     params, uploaded_files, uploaded_audio_file, uploaded_bgm_file, voice_mode
 ):
@@ -5736,6 +5967,7 @@ def _render_generation_controls(
         # 已经得到明确处理，清除标记，避免后续普通生成继续显示旧提示。
         st.session_state.pop("task_restore_upload_requirements", None)
 
+    _render_brand_kit_settings(params)
     _render_settings_transfer(params)
 
     start_button = st.button(
