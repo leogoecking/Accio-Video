@@ -268,6 +268,51 @@ class TestStoryboardComponent(unittest.TestCase):
         self.assertEqual(task.get("state"), const.TASK_STATE_PROCESSING)
         self.assertEqual(task.get("progress"), 65)
 
+    def test_render_final_from_draft_recovers_when_task_not_in_state(self):
+        import json
+        from app.models import const
+        from app.services import state as sm
+        from app.services import task as tm
+
+        task_id = "test_draft_recovery_disk"
+        # Ensure task is NOT in memory state
+        sm.state.delete_task(task_id)
+
+        # Write script.json to temp dir
+        script_data = {
+            "script": "Recovered script",
+            "params": {"video_subject": "Disk Recovery", "video_aspect": "9:16"},
+        }
+        with open(os.path.join(self.temp_dir.name, "script.json"), "w", encoding="utf-8") as f:
+            json.dump(script_data, f)
+
+        # Create valid material file
+        mat_path = os.path.join(self.temp_dir.name, "clip1.mp4")
+        with open(mat_path, "wb") as f:
+            f.write(b"dummy")
+
+        draft = StoryboardDraft(
+            task_id=task_id,
+            video_subject="Disk Recovery",
+            total_duration=5.0,
+            scenes=[
+                StoryboardScene(scene_index=1, text="Recovered scene", material_path=mat_path),
+            ],
+        )
+
+        with (
+            patch("app.utils.utils.task_dir", return_value=self.temp_dir.name),
+            patch(
+                "app.services.task.generate_final_videos",
+                return_value=(["/tmp/final-1.mp4"], ["/tmp/comb-1.mp4"], []),
+            ) as mock_final,
+        ):
+            res = tm.render_final_from_draft(task_id, draft=draft)
+
+        self.assertEqual(res["state"], const.TASK_STATE_COMPLETE)
+        self.assertEqual(res["videos"], ["/tmp/final-1.mp4"])
+        mock_final.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

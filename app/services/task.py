@@ -1534,14 +1534,31 @@ def render_final_from_draft(
     )
 
     current_task = sm.state.get_task(task_id) or {}
-    if not current_task:
-        return _mark_task_failed(task_id, "draft", "task not found")
+    task_dir_path = utils.task_dir(task_id)
 
     if draft is None:
         draft = load_storyboard_draft(task_id)
 
     if not draft:
         return _mark_task_failed(task_id, "draft", "storyboard draft not found")
+
+    if not current_task:
+        script_file = os.path.join(task_dir_path, "script.json")
+        loaded_params = {}
+        if os.path.isfile(script_file):
+            try:
+                with open(script_file, "r", encoding="utf-8") as sf:
+                    data = json.load(sf)
+                    loaded_params = data.get("params") or {}
+            except Exception:
+                loaded_params = {}
+        current_task = {
+            "task_id": task_id,
+            "params": loaded_params,
+            "audio_file": os.path.join(task_dir_path, "audio.mp3"),
+            "subtitle_path": os.path.join(task_dir_path, "subtitle.srt"),
+            "audio_duration": float(draft.total_duration or 0.0),
+        }
 
     if params is None:
         raw_params = current_task.get("params") or {}

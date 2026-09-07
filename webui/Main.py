@@ -718,6 +718,8 @@ def _task_state_label(state, has_video):
         return tr("Task Status Failed")
     if normalized_state == const.TASK_STATE_PROCESSING:
         return tr("Task Status Processing")
+    if normalized_state == getattr(const, "TASK_STATE_DRAFT_READY", 2):
+        return tr("Review Draft (Storyboard before final render)")
     if has_video:
         return tr("Task Status Complete")
     return tr("Task Status History")
@@ -725,11 +727,14 @@ def _task_state_label(state, has_video):
 
 def _task_state_filter_key(task):
     normalized_state = _normalize_task_state(task.get("state"))
-    if normalized_state == const.TASK_STATE_PROCESSING:
+    if normalized_state in (
+        const.TASK_STATE_PROCESSING,
+        getattr(const, "TASK_STATE_DRAFT_READY", 2),
+    ):
         return "processing"
     if normalized_state == const.TASK_STATE_FAILED:
         return "failed"
-    if normalized_state == const.TASK_STATE_COMPLETE or task["video_file"]:
+    if normalized_state == const.TASK_STATE_COMPLETE or task.get("video_file"):
         return "complete"
     return "history"
 
@@ -770,17 +775,21 @@ def _scan_history_tasks(limit=30):
         script_data = _safe_load_task_script(task_path)
         params_data = script_data.get("params", {}) if script_data else {}
         video_file = _find_final_task_video(task_path)
+        has_draft = os.path.isfile(os.path.join(task_path, "draft.json"))
         subject = (
             params_data.get("video_subject")
             or script_data.get("script", "")[:40]
             or name
         )
+        task_state = const.TASK_STATE_COMPLETE if video_file else (
+            getattr(const, "TASK_STATE_DRAFT_READY", 2) if has_draft else None
+        )
         tasks.append(
             {
                 "task_id": name,
                 "subject": subject,
-                "state": const.TASK_STATE_COMPLETE if video_file else None,
-                "progress": 100 if video_file else 0,
+                "state": task_state,
+                "progress": 100 if video_file else (60 if has_draft else 0),
                 "mtime": mtime,
                 "task_path": task_path,
                 "video_file": video_file,
@@ -1011,16 +1020,28 @@ def _render_task_table(filtered_tasks, key_prefix):
                     gap="small",
                 )
                 with action_cols[0]:
-                    play_label = tr("Play")
-                    if st.button(
-                        play_label,
-                        key=f"play_task_{key_prefix}_{task_id}",
-                        use_container_width=True,
-                        icon=":material/play_arrow:",
-                        help=play_label,
-                        disabled=not has_video,
-                    ):
-                        _open_task_video(task["video_file"])
+                    if task.get("state") == getattr(const, "TASK_STATE_DRAFT_READY", 2) and not has_video:
+                        review_label = tr("Review Draft (Storyboard before final render)")
+                        if st.button(
+                            review_label,
+                            key=f"review_task_{key_prefix}_{task_id}",
+                            use_container_width=True,
+                            icon=":material/draw:",
+                            help=review_label,
+                        ):
+                            st.session_state["current_generation_task_id"] = task_id
+                            st.rerun(scope="app")
+                    else:
+                        play_label = tr("Play")
+                        if st.button(
+                            play_label,
+                            key=f"play_task_{key_prefix}_{task_id}",
+                            use_container_width=True,
+                            icon=":material/play_arrow:",
+                            help=play_label,
+                            disabled=not has_video,
+                        ):
+                            _open_task_video(task["video_file"])
 
                 with action_cols[1]:
                     open_label = tr("Open Task Folder")
@@ -1651,6 +1672,11 @@ def _render_generation_task_snapshot(task_id, task):
         _render_generation_logs(task_id)
         return
 
+    if state == getattr(const, "TASK_STATE_DRAFT_READY", 2):
+        st.info(tr("Review Draft (Storyboard before final render)"))
+        _render_generation_logs(task_id)
+        return
+
     if state == const.TASK_STATE_FAILED:
         error = str(task.get("error") or "").strip()
         message = tr("Video Generation Failed")
@@ -1744,8 +1770,13 @@ def _render_running_generation_task(task_id):
         return
 
     state = _normalize_task_state((task or {}).get("state"))
-    if state in {const.TASK_STATE_COMPLETE, const.TASK_STATE_FAILED}:
-        _remove_active_generation_task(task_id)
+    if state in {
+        const.TASK_STATE_COMPLETE,
+        const.TASK_STATE_FAILED,
+        getattr(const, "TASK_STATE_DRAFT_READY", 2),
+    }:
+        if state in {const.TASK_STATE_COMPLETE, const.TASK_STATE_FAILED}:
+            _remove_active_generation_task(task_id)
         # 完整页面脚本现在没有耗时生成逻辑，可以安全 rerun 并把结果改为静态
         # 渲染。这样任务结束后不会让浏览器永久保留一个两秒轮询的 Fragment。
         st.rerun(scope="app")
@@ -1757,6 +1788,15 @@ def _render_current_generation_task():
     """在生成按钮下方恢复当前页面最近提交任务的可查询 UI。"""
     task_id = st.session_state.get("current_generation_task_id", "")
     if not task_id:
+        active_tasks = _active_generation_tasks()
+        if active_tasks:
+            task_id = max(
+                active_tasks.items(),
+                key=lambda x: x[1].get("mtime", 0) if isinstance(x[1], Mapping) else 0,
+            )[0]
+            st.session_state["current_generation_task_id"] = task_id
+
+    if not task_id:
         return
 
     try:
@@ -1767,6 +1807,23 @@ def _render_current_generation_task():
         )
         st.error(tr("Video Generation Failed"))
         return
+
+    if not task:
+        task_dir_path = utils.task_dir(task_id)
+        draft_file = os.path.join(task_dir_path, "draft.json")
+        if os.path.isfile(draft_file):
+            video_file = _find_final_task_video(task_dir_path)
+            if not video_file:
+                task = {
+                    "task_id": task_id,
+                    "state": getattr(const, "TASK_STATE_DRAFT_READY", 2),
+                    "progress": 60,
+                }
+                sm.state.update_task(
+                    task_id,
+                    state=task["state"],
+                    progress=task["progress"],
+                )
 
     state = _normalize_task_state((task or {}).get("state"))
     if state == getattr(const, "TASK_STATE_DRAFT_READY", 2):
