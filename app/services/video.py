@@ -545,6 +545,7 @@ def combine_videos(
     max_clip_duration: int = 5,
     threads: int = 2,
     clip_speed: float = 1.0,
+    scene_durations: List[float] | None = None,
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
     try:
@@ -582,6 +583,132 @@ def combine_videos(
     processed_clips = []
     subclipped_items = []
     video_duration = 0
+
+    #  storyboard 模式：按精确场景时长切割/渲染素材，保证画面与字幕配音严格对齐
+    if scene_durations and len(scene_durations) == len(video_paths):
+        logger.info(
+            f"combining {len(video_paths)} storyboard scenes with exact scene durations"
+        )
+        for i, (video_path, scene_dur) in enumerate(zip(video_paths, scene_durations)):
+            if scene_dur <= 0.05 or not os.path.exists(video_path):
+                continue
+
+            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+            ext = os.path.splitext(video_path)[1].lower()
+
+            # 1. 静态图片转电影级 Ken Burns 运动片段
+            if ext in (".jpg", ".jpeg", ".png", ".webp"):
+                from app.services import ai_image
+
+                motion_type = random.choice(["zoom_in", "zoom_out"])
+                rendered_img = ai_image.render_image_to_ken_burns_clip(
+                    image_path=video_path,
+                    output_path=clip_file,
+                    duration=scene_dur,
+                    video_aspect=aspect,
+                    motion=motion_type,
+                    fps=fps,
+                )
+                if rendered_img and os.path.isfile(rendered_img):
+                    processed_clips.append(
+                        SubClippedVideoClip(
+                            file_path=clip_file,
+                            duration=scene_dur,
+                            width=video_width,
+                            height=video_height,
+                            source_file_path=video_path,
+                        )
+                    )
+                    video_duration += scene_dur
+                    continue
+
+            # 2. 视频素材按精确时长截取
+            clip = _open_video_clip_quietly(video_path)
+            clip_dur = clip.duration
+            close_clip(clip)
+
+            source_dur = min(clip_dur, scene_dur * normalized_clip_speed)
+            rendered_with_ffmpeg = False
+            chosen_transition = transition_value
+            if chosen_transition in ("shuffle", VideoTransitionMode.shuffle.value):
+                chosen_transition = random.choice(
+                    ["fadein", "fadeout", "slidein", "slideout", "zoomin", "zoomout"]
+                )
+
+            try:
+                rendered_with_ffmpeg = ffmpeg_video.render_subclip_with_ffmpeg(
+                    source_path=video_path,
+                    start_time=0.0,
+                    source_duration=source_dur,
+                    output_path=clip_file,
+                    target_width=video_width,
+                    target_height=video_height,
+                    clip_speed=normalized_clip_speed,
+                    transition_mode=chosen_transition,
+                    effective_duration=scene_dur,
+                    codec=_get_effective_video_codec(),
+                    threads=threads,
+                    fps=fps,
+                )
+            except Exception as exc:
+                logger.debug(f"ffmpeg storyboard subclip render failed: {exc}")
+                rendered_with_ffmpeg = False
+
+            if (
+                not rendered_with_ffmpeg
+                or not os.path.isfile(clip_file)
+                or os.path.getsize(clip_file) == 0
+            ):
+                try:
+                    clip = _open_video_clip_quietly(video_path)
+                    if clip.duration < scene_dur:
+                        from moviepy.video.fx import loop as vfx_loop
+
+                        clip = vfx_loop.loop(clip, duration=scene_dur)
+                    else:
+                        clip = clip.subclipped(0, scene_dur)
+
+                    if clip.size != (video_width, video_height):
+                        clip = clip.resized(new_size=(video_width, video_height))
+
+                    _write_videofile_with_codec_fallback(
+                        clip,
+                        clip_file,
+                        codec=_get_configured_video_codec(),
+                        logger=None,
+                        fps=fps,
+                    )
+                    close_clip(clip)
+                except Exception as m_err:
+                    logger.warning(
+                        f"fallback subclip failed for {video_path}: {m_err}"
+                    )
+                    continue
+
+            processed_clips.append(
+                SubClippedVideoClip(
+                    file_path=clip_file,
+                    duration=scene_dur,
+                    width=video_width,
+                    height=video_height,
+                    source_file_path=video_path,
+                )
+            )
+            video_duration += scene_dur
+
+        if processed_clips:
+            clip_files = [c.file_path for c in processed_clips]
+            logger.info(
+                f"concatenating {len(clip_files)} storyboard scene clips with ffmpeg"
+            )
+            concat_video_clips_with_ffmpeg(
+                clip_files=clip_files,
+                output_file=combined_video_path,
+                threads=threads,
+                fps=fps,
+            )
+            return combined_video_path
+
     for video_path in video_paths:
         clip = _open_video_clip_quietly(video_path)
         clip_duration = clip.duration

@@ -23,6 +23,8 @@ class StoryboardScene:
     scene_index: int
     text: str
     duration: float = 4.0
+    start_time: float = 0.0
+    end_time: float = 0.0
     material_path: str = ""
     material_provider: str = ""
     search_term: str = ""
@@ -40,6 +42,8 @@ class StoryboardScene:
             scene_index=data.get("scene_index", 0),
             text=data.get("text", ""),
             duration=float(data.get("duration", 4.0)),
+            start_time=float(data.get("start_time", 0.0)),
+            end_time=float(data.get("end_time", 0.0)),
             material_path=data.get("material_path", ""),
             material_provider=data.get("material_provider", ""),
             search_term=data.get("search_term", ""),
@@ -83,10 +87,10 @@ class StoryboardDraft:
             task_id=data.get("task_id", ""),
             video_subject=data.get("video_subject", ""),
             total_duration=float(data.get("total_duration", 0.0)),
+            scenes=scenes,
             status=data.get("status", "draft_ready"),
             created_at=float(data.get("created_at", 0.0)),
             updated_at=float(data.get("updated_at", 0.0)),
-            scenes=scenes,
         )
 
 
@@ -134,6 +138,155 @@ def generate_scene_thumbnail(
     return None
 
 
+def parse_srt_time_to_seconds(time_str: str) -> float:
+    """Parse SRT timestamp '00:00:04,975' to seconds float."""
+    try:
+        parts = time_str.strip().split(":")
+        h = int(parts[0])
+        m = int(parts[1])
+        s_parts = parts[2].replace(".", ",").split(",")
+        s = int(s_parts[0])
+        ms = int(s_parts[1]) if len(s_parts) > 1 else 0
+        return h * 3600 + m * 60 + s + ms / 1000.0
+    except Exception:
+        return 0.0
+
+
+def parse_subtitles_to_scenes(
+    subtitle_path: str,
+    script_lines: list[str],
+    total_audio_duration: float,
+) -> list[dict[str, Any]]:
+    """
+    Maps script paragraphs to subtitle time spans to produce exact, continuous
+    scene timestamps aligned with the narration audio.
+    """
+    import re
+    from app.services.subtitle import file_to_subtitles
+
+    raw_subs = file_to_subtitles(subtitle_path)
+    if not raw_subs:
+        dur_per_scene = (
+            (total_audio_duration / len(script_lines))
+            if (total_audio_duration and script_lines)
+            else 4.0
+        )
+        return [
+            {
+                "text": line,
+                "start": round(i * dur_per_scene, 2),
+                "end": round((i + 1) * dur_per_scene, 2),
+                "duration": round(dur_per_scene, 2),
+            }
+            for i, line in enumerate(script_lines)
+        ]
+
+    parsed_subs = []
+    for _idx, times, text in raw_subs:
+        if " --> " in times:
+            start_str, end_str = times.split(" --> ")
+            parsed_subs.append({
+                "start": parse_srt_time_to_seconds(start_str),
+                "end": parse_srt_time_to_seconds(end_str),
+                "text": text,
+            })
+
+    if not parsed_subs:
+        dur_per_scene = (
+            (total_audio_duration / len(script_lines))
+            if (total_audio_duration and script_lines)
+            else 4.0
+        )
+        return [
+            {
+                "text": line,
+                "start": round(i * dur_per_scene, 2),
+                "end": round((i + 1) * dur_per_scene, 2),
+                "duration": round(dur_per_scene, 2),
+            }
+            for i, line in enumerate(script_lines)
+        ]
+
+    scenes = []
+    sub_idx = 0
+    prev_end = 0.0
+
+    for p_idx, p in enumerate(script_lines):
+        p_clean = re.sub(r"[^\w\s]", "", p.lower())
+        p_words = p_clean.split()
+        matched = []
+
+        while sub_idx < len(parsed_subs):
+            sub_clean = re.sub(r"[^\w\s]", "", parsed_subs[sub_idx]["text"].lower())
+            sub_words = sub_clean.split()
+            if any(w in p_words for w in sub_words):
+                matched.append(parsed_subs[sub_idx])
+                sub_idx += 1
+                if sub_words and sub_words[-1] in p_words[-2:]:
+                    break
+            else:
+                if not matched:
+                    matched.append(parsed_subs[sub_idx])
+                    sub_idx += 1
+                break
+
+        if p_idx == len(script_lines) - 1:
+            end_time = (
+                total_audio_duration
+                if total_audio_duration > prev_end
+                else (matched[-1]["end"] if matched else prev_end + 3.0)
+            )
+        elif matched and sub_idx < len(parsed_subs):
+            end_time = (matched[-1]["end"] + parsed_subs[sub_idx]["start"]) / 2.0
+        elif matched:
+            end_time = matched[-1]["end"]
+        else:
+            end_time = prev_end + 3.5
+
+        dur = max(0.5, round(end_time - prev_end, 2))
+        scenes.append({
+            "text": p,
+            "start": round(prev_end, 2),
+            "end": round(prev_end + dur, 2),
+            "duration": dur,
+        })
+        prev_end = prev_end + dur
+
+    return scenes
+
+
+def generate_scene_image_prompt(scene_text: str, context_term: str = "") -> str:
+    """
+    Uses LLM to convert a narration sentence into a concise, photorealistic
+    visual prompt in English for image generation.
+    """
+    clean_text = scene_text.strip()
+    if not clean_text:
+        return context_term or "cinematic video scene"
+
+    try:
+        from app.services import llm
+
+        prompt = (
+            f"Convert this video narration sentence into a single concise, photorealistic English visual prompt "
+            f"(under 25 words) for an image generator (like Midjourney or Flux). Describe a concrete physical visual scene:\n"
+            f"Narration: \"{clean_text}\"\n"
+            f"Context: \"{context_term.strip()}\"\n"
+            f"Rules:\n"
+            f"- Output ONLY the English visual description (Subject, Environment, Lighting, Style).\n"
+            f"- No preamble, no quotes, no conversational intro."
+        )
+        response = llm._generate_response(prompt)
+        if response and not response.startswith("Error:"):
+            cleaned = response.strip().strip('"\'')
+            if len(cleaned) > 5:
+                return cleaned
+    except Exception as exc:
+        logger.warning(f"failed to generate scene image prompt via LLM: {exc}")
+
+    return context_term or clean_text[:60]
+
+
 def create_storyboard_draft(
     task_id: str,
     video_subject: str,
@@ -141,9 +294,11 @@ def create_storyboard_draft(
     video_paths: list[str],
     audio_duration: float = 0.0,
     material_sources: list[dict[str, Any]] | None = None,
+    subtitle_path: str | None = None,
 ) -> StoryboardDraft:
     """
-    Assemble a new StoryboardDraft from raw script lines and matched video paths.
+    Assemble a new StoryboardDraft from raw script lines and matched video paths,
+    aligning scene durations accurately with subtitle timestamps.
     """
     import time
 
@@ -151,18 +306,51 @@ def create_storyboard_draft(
     sources = material_sources or []
     scenes: list[StoryboardScene] = []
 
-    total_scenes = max(len(script_lines), len(video_paths), 1)
-    dur_per_scene = (audio_duration / total_scenes) if (audio_duration and total_scenes) else 4.0
+    clean_lines = [line.strip() for line in script_lines if line.strip()]
+    if not clean_lines:
+        clean_lines = [video_subject or "Scene 1"]
+
+    if subtitle_path and os.path.isfile(subtitle_path):
+        timed_scenes = parse_subtitles_to_scenes(
+            subtitle_path, clean_lines, audio_duration
+        )
+    else:
+        dur_per_scene = (
+            (audio_duration / len(clean_lines))
+            if (audio_duration and clean_lines)
+            else 4.0
+        )
+        timed_scenes = [
+            {
+                "text": line,
+                "start": round(i * dur_per_scene, 2),
+                "end": round((i + 1) * dur_per_scene, 2),
+                "duration": round(dur_per_scene, 2),
+            }
+            for i, line in enumerate(clean_lines)
+        ]
 
     task_dir = utils.task_dir(task_id) if task_id else ""
     thumbs_dir = os.path.join(task_dir, "thumbnails") if task_dir else ""
 
-    for idx in range(total_scenes):
-        text = script_lines[idx] if idx < len(script_lines) else ""
-        vid = video_paths[idx] if idx < len(video_paths) else (video_paths[0] if video_paths else "")
-        source_meta = sources[idx] if idx < len(sources) else {}
-        provider = source_meta.get("provider", "stock") if isinstance(source_meta, dict) else "stock"
-        term = source_meta.get("search_term", "") if isinstance(source_meta, dict) else ""
+    for idx, s_info in enumerate(timed_scenes):
+        text = s_info["text"]
+        dur = s_info["duration"]
+        start_t = s_info.get("start", 0.0)
+        end_t = s_info.get("end", 0.0)
+
+        vid = video_paths[idx % len(video_paths)] if video_paths else ""
+        source_meta = sources[idx % len(sources)] if sources else {}
+        provider = (
+            source_meta.get("provider", "stock")
+            if isinstance(source_meta, dict)
+            else "stock"
+        )
+        term = (
+            source_meta.get("search_term", "")
+            if isinstance(source_meta, dict)
+            else ""
+        )
 
         thumb_path = ""
         if vid and thumbs_dir:
@@ -172,7 +360,9 @@ def create_storyboard_draft(
         scene = StoryboardScene(
             scene_index=idx + 1,
             text=text,
-            duration=round(dur_per_scene, 2),
+            duration=round(dur, 2),
+            start_time=round(start_t, 2),
+            end_time=round(end_t, 2),
             material_path=vid,
             material_provider=provider,
             search_term=term,

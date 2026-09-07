@@ -767,7 +767,13 @@ def _record_loomloom_run_reference(
 
 
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
+    task_id,
+    params,
+    downloaded_videos,
+    audio_file,
+    subtitle_path,
+    audio_duration,
+    scene_durations: list[float] | None = None,
 ):
     final_video_paths = []
     combined_video_paths = []
@@ -804,6 +810,7 @@ def generate_final_videos(
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
+            scene_durations=scene_durations,
         )
 
         _progress += 50 / params.video_count / 2
@@ -1397,11 +1404,12 @@ def _run_pipeline(
             lines = [video_script]
 
         sources = []
-        sources_file = os.path.join(task_dir, "material_sources.json")
-        if os.path.isfile(sources_file):
+        script_file = os.path.join(task_dir, "script.json")
+        if os.path.isfile(script_file):
             try:
-                with open(sources_file, "r", encoding="utf-8") as sf:
-                    sources = json.load(sf)
+                with open(script_file, "r", encoding="utf-8") as sf:
+                    s_data = json.load(sf)
+                    sources = s_data.get("material_sources", [])
             except Exception:
                 sources = []
 
@@ -1412,6 +1420,7 @@ def _run_pipeline(
             video_paths=downloaded_videos,
             audio_duration=audio_duration,
             material_sources=sources,
+            subtitle_path=subtitle_path,
         )
         save_storyboard_draft(task_id, draft)
 
@@ -1572,8 +1581,14 @@ def render_final_from_draft(
         for scene in draft.scenes
         if scene.material_path and os.path.exists(scene.material_path)
     ]
+    scene_durations = [
+        float(scene.duration)
+        for scene in draft.scenes
+        if scene.material_path and os.path.exists(scene.material_path)
+    ]
     if not approved_videos:
         approved_videos = current_task.get("materials", [])
+        scene_durations = None
 
     if not approved_videos:
         return _mark_task_failed(
@@ -1594,7 +1609,7 @@ def render_final_from_draft(
     if type(params.video_concat_mode) is str:
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
-    # 3. Generate final videos
+    # 3. Generate final videos with scene-exact timing
     final_video_paths, combined_video_paths, generation_warnings = (
         generate_final_videos(
             task_id,
@@ -1603,6 +1618,7 @@ def render_final_from_draft(
             audio_file,
             subtitle_path,
             audio_duration,
+            scene_durations=scene_durations,
         )
     )
 

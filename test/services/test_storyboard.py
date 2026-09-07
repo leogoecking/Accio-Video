@@ -7,12 +7,16 @@ from webui.components.storyboard import (
     StoryboardDraft,
     StoryboardScene,
     create_storyboard_draft,
+    generate_scene_image_prompt,
     generate_scene_thumbnail,
     load_storyboard_draft,
+    parse_srt_time_to_seconds,
+    parse_subtitles_to_scenes,
     save_storyboard_draft,
     update_scene_material,
     update_scene_text,
 )
+
 
 
 class TestStoryboardComponent(unittest.TestCase):
@@ -312,6 +316,72 @@ class TestStoryboardComponent(unittest.TestCase):
         self.assertEqual(res["state"], const.TASK_STATE_COMPLETE)
         self.assertEqual(res["videos"], ["/tmp/final-1.mp4"])
         mock_final.assert_called_once()
+
+    def test_parse_srt_time_to_seconds(self):
+        self.assertEqual(parse_srt_time_to_seconds("00:00:05,500"), 5.5)
+        self.assertEqual(parse_srt_time_to_seconds("00:01:30,000"), 90.0)
+        self.assertEqual(parse_srt_time_to_seconds("01:00:00,000"), 3600.0)
+
+    def test_parse_subtitles_to_scenes(self):
+        srt_content = (
+            "1\n00:00:00,000 --> 00:00:02,500\nPrimeira frase falada\n\n"
+            "2\n00:00:02,500 --> 00:00:06,000\nSegunda frase falada no video\n\n"
+            "3\n00:00:06,000 --> 00:00:10,000\nTerceira frase final\n\n"
+        )
+        srt_path = os.path.join(self.temp_dir.name, "test.srt")
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+
+        script_lines = [
+            "Primeira frase falada",
+            "Segunda frase falada no video",
+            "Terceira frase final",
+        ]
+        scenes = parse_subtitles_to_scenes(srt_path, script_lines, total_audio_duration=10.0)
+        self.assertEqual(len(scenes), 3)
+        self.assertEqual(scenes[0]["start"], 0.0)
+        self.assertEqual(scenes[0]["text"], "Primeira frase falada")
+        self.assertEqual(scenes[2]["end"], 10.0)
+        # Total duration should sum to total_audio_duration
+        self.assertAlmostEqual(sum(s["duration"] for s in scenes), 10.0, delta=0.2)
+
+    def test_generate_scene_image_prompt_llm(self):
+        with patch("app.services.llm._generate_response", return_value="Vintage books in a candlelit archive"):
+            prompt = generate_scene_image_prompt("Livros antigos guardados na biblioteca", "books")
+            self.assertEqual(prompt, "Vintage books in a candlelit archive")
+
+    def test_create_storyboard_draft_with_subtitles(self):
+        srt_content = (
+            "1\n00:00:00,000 --> 00:00:03,000\nHello world\n\n"
+            "2\n00:00:03,000 --> 00:00:07,000\nNext chapter begins\n\n"
+        )
+        srt_path = os.path.join(self.temp_dir.name, "sub.srt")
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+
+        script_lines = ["Hello world", "Next chapter begins"]
+        video_paths = ["/v/1.mp4", "/v/2.mp4"]
+        sources = [
+            {"provider": "stock", "search_term": "world greeting"},
+            {"provider": "stock", "search_term": "book chapter"},
+        ]
+
+        with patch("app.utils.utils.task_dir", return_value=self.temp_dir.name):
+            draft = create_storyboard_draft(
+                task_id="task_sub_timed",
+                video_subject="Timed Video",
+                script_lines=script_lines,
+                video_paths=video_paths,
+                audio_duration=7.0,
+                material_sources=sources,
+                subtitle_path=srt_path,
+            )
+
+        self.assertEqual(len(draft.scenes), 2)
+        self.assertEqual(draft.scenes[0].start_time, 0.0)
+        self.assertGreater(draft.scenes[0].duration, 0.0)
+        self.assertEqual(draft.scenes[1].end_time, 7.0)
+        self.assertEqual(draft.scenes[0].search_term, "world greeting")
 
 
 if __name__ == "__main__":
