@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import json
 import os.path
 import re
@@ -19,7 +20,189 @@ initial_prompt = config.whisper.get("initial_prompt", "") or None
 model = None
 
 
-def create(audio_file, subtitle_file: str = ""):
+@dataclass
+class SubtitleWord:
+    word: str
+    start: float
+    end: float
+
+
+def hex_to_ass_color(color: str, alpha: int = 0) -> str:
+    """Convert hex color (#RRGGBB) to ASS color (&HAABBGGRR)."""
+    if isinstance(color, str) and color.startswith("#") and len(color) == 7:
+        try:
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
+            return f"&H{alpha:02X}{b:02X}{g:02X}{r:02X}&"
+        except ValueError:
+            pass
+    return f"&H{alpha:02X}FFFFFF&"
+
+
+def format_ass_timestamp(seconds: float) -> str:
+    """Format seconds into ASS timestamp format: H:MM:SS.cs"""
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    cs = int(round((seconds - int(seconds)) * 100))
+    if cs >= 100:
+        cs = 0
+        s += 1
+        if s >= 60:
+            s = 0
+            m += 1
+            if m >= 60:
+                m = 0
+                h += 1
+    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+
+def build_karaoke_subtitles(
+    words: list[SubtitleWord],
+    highlight_color: str = "#FFDD00",
+    max_words: int = 3,
+    is_cjk_lang: bool = False,
+) -> tuple[list[dict], str]:
+    """
+    Groups words into short visual chunks and emits dynamic karaoke SRT cues.
+    Each cue illuminates the active spoken word with `<font color="{highlight_color}">`.
+    """
+    cleaned_words = [
+        w for w in words
+        if w.word and w.word.strip() and w.end > w.start
+    ]
+    if not cleaned_words:
+        return [], ""
+
+    max_words = max(1, int(max_words or 3))
+    chunks: list[list[SubtitleWord]] = []
+    current_chunk: list[SubtitleWord] = []
+
+    for i, w in enumerate(cleaned_words):
+        current_chunk.append(w)
+        is_last = (i == len(cleaned_words) - 1)
+        has_punct = utils.str_contains_punctuation(w.word)
+        has_gap = False if is_last else (cleaned_words[i + 1].start - w.end > 0.8)
+
+        if len(current_chunk) >= max_words or has_punct or has_gap or is_last:
+            chunks.append(current_chunk)
+            current_chunk = []
+
+    subtitles = []
+    lines = []
+    idx = 1
+    separator = "" if is_cjk_lang else " "
+
+    for chunk in chunks:
+        n = len(chunk)
+        for i in range(n):
+            cue_start = chunk[i].start
+            cue_end = (
+                chunk[i + 1].start
+                if (i < n - 1 and chunk[i + 1].start > chunk[i].start)
+                else chunk[i].end
+            )
+            if cue_end <= cue_start:
+                cue_end = cue_start + 0.1
+
+            formatted = []
+            for j, cw in enumerate(chunk):
+                word_text = cw.word.strip()
+                if j == i:
+                    formatted.append(f'<font color="{highlight_color}">{word_text}</font>')
+                else:
+                    formatted.append(word_text)
+
+            cue_text = separator.join(formatted)
+            subtitles.append({"msg": cue_text, "start_time": cue_start, "end_time": cue_end})
+            lines.append(utils.text_to_srt(idx, cue_text, cue_start, cue_end))
+            idx += 1
+
+    srt_content = "\n".join(lines) + "\n"
+    return subtitles, srt_content
+
+
+def write_ass_subtitles(
+    words: list[SubtitleWord],
+    ass_file: str,
+    font_name: str = "Arial",
+    font_size: int = 60,
+    primary_color: str = "#FFFFFF",
+    highlight_color: str = "#FFDD00",
+    stroke_color: str = "#000000",
+    stroke_width: float = 2.0,
+    max_words: int = 3,
+    is_cjk_lang: bool = False,
+):
+    """Writes Advanced SubStation Alpha (.ass) file with native \\k karaoke tags."""
+    cleaned_words = [
+        w for w in words
+        if w.word and w.word.strip() and w.end > w.start
+    ]
+    if not cleaned_words:
+        return
+
+    max_words = max(1, int(max_words or 3))
+    pri_ass = hex_to_ass_color(primary_color)
+    sec_ass = hex_to_ass_color(highlight_color)
+    out_ass = hex_to_ass_color(stroke_color)
+
+    header = f"""[Script Info]
+Title: Accio Video Karaoke Subtitles
+ScriptType: v4.00+
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+PlayResX: 1080
+PlayResY: 1920
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Karaoke,{font_name},{font_size},{pri_ass},{sec_ass},{out_ass},&H80000000,-1,0,0,0,100,100,0,0,1,{int(stroke_width)},2,2,40,40,140,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    chunks = []
+    current_chunk = []
+    for i, w in enumerate(cleaned_words):
+        current_chunk.append(w)
+        is_last = (i == len(cleaned_words) - 1)
+        has_punct = utils.str_contains_punctuation(w.word)
+        has_gap = False if is_last else (cleaned_words[i + 1].start - w.end > 0.8)
+        if len(current_chunk) >= max_words or has_punct or has_gap or is_last:
+            chunks.append(current_chunk)
+            current_chunk = []
+
+    dialogues = []
+    separator = "" if is_cjk_lang else " "
+    for chunk in chunks:
+        chunk_start = chunk[0].start
+        chunk_end = chunk[-1].end
+        start_str = format_ass_timestamp(chunk_start)
+        end_str = format_ass_timestamp(chunk_end)
+
+        parts = []
+        for w in chunk:
+            dur_cs = max(1, int(round((w.end - w.start) * 100)))
+            parts.append(f"{{\\k{dur_cs}}}{w.word.strip()}")
+
+        dialogue_text = separator.join(parts)
+        dialogues.append(f"Dialogue: 0,{start_str},{end_str},Karaoke,,0,0,0,,{dialogue_text}")
+
+    content = header + "\n".join(dialogues) + "\n"
+    with open(ass_file, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def create(
+    audio_file,
+    subtitle_file: str = "",
+    subtitle_style: str = "classic",
+    karaoke_highlight_color: str = "#FFDD00",
+    karaoke_max_words: int = 3,
+):
     global model
     if WhisperModel is None:
         logger.warning("faster_whisper not available, skipping whisper subtitle generation")
@@ -48,7 +231,7 @@ def create(audio_file, subtitle_file: str = ""):
             )
             return None
 
-    logger.info(f"start, output file: {subtitle_file}")
+    logger.info(f"start, output file: {subtitle_file}, style: {subtitle_style}")
     if not subtitle_file:
         subtitle_file = f"{audio_file}.srt"
 
@@ -61,11 +244,52 @@ def create(audio_file, subtitle_file: str = ""):
         **({"initial_prompt": initial_prompt} if initial_prompt else {}),
     )
 
+    detected_lang = getattr(info, "language", "") or "en"
     logger.info(
-        f"detected language: '{info.language}', probability: {info.language_probability:.2f}"
+        f"detected language: '{detected_lang}', probability: {getattr(info, 'language_probability', 0.0):.2f}"
     )
 
     start = timer()
+    is_cjk = detected_lang in ("zh", "ja", "ko")
+
+    if subtitle_style == "karaoke":
+        words: list[SubtitleWord] = []
+        for segment in segments:
+            if getattr(segment, "words", None):
+                for w in segment.words:
+                    clean_w = w.word.strip()
+                    if clean_w:
+                        words.append(
+                            SubtitleWord(
+                                word=clean_w,
+                                start=float(w.start),
+                                end=float(w.end),
+                            )
+                        )
+        _, srt_content = build_karaoke_subtitles(
+            words=words,
+            highlight_color=karaoke_highlight_color,
+            max_words=karaoke_max_words,
+            is_cjk_lang=is_cjk,
+        )
+        with open(subtitle_file, "w", encoding="utf-8") as f:
+            f.write(srt_content)
+        try:
+            ass_file = os.path.splitext(subtitle_file)[0] + ".ass"
+            write_ass_subtitles(
+                words=words,
+                ass_file=ass_file,
+                highlight_color=karaoke_highlight_color,
+                max_words=karaoke_max_words,
+                is_cjk_lang=is_cjk,
+            )
+        except Exception as ass_err:
+            logger.debug(f"failed to export ASS subtitles: {ass_err}")
+
+        diff = timer() - start
+        logger.info(f"complete karaoke subtitles, elapsed: {diff:.2f} s")
+        return subtitle_file
+
     subtitles = []
 
     def recognized(seg_text, seg_start, seg_end):
@@ -82,13 +306,13 @@ def create(audio_file, subtitle_file: str = ""):
 
     for segment in segments:
         words_idx = 0
-        words_len = len(segment.words)
+        words_len = len(segment.words) if getattr(segment, "words", None) else 0
 
         seg_start = 0
         seg_end = 0
         seg_text = ""
 
-        if segment.words:
+        if getattr(segment, "words", None):
             is_segmented = False
             for word in segment.words:
                 if not is_segmented:
@@ -122,18 +346,17 @@ def create(audio_file, subtitle_file: str = ""):
         recognized(seg_text, seg_start, seg_end)
 
     end = timer()
-
     diff = end - start
     logger.info(f"complete, elapsed: {diff:.2f} s")
 
     idx = 1
     lines = []
-    for subtitle in subtitles:
-        text = subtitle.get("msg")
+    for subtitle_item in subtitles:
+        text = subtitle_item.get("msg")
         if text:
             lines.append(
                 utils.text_to_srt(
-                    idx, text, subtitle.get("start_time"), subtitle.get("end_time")
+                    idx, text, subtitle_item.get("start_time"), subtitle_item.get("end_time")
                 )
             )
             idx += 1
@@ -142,6 +365,7 @@ def create(audio_file, subtitle_file: str = ""):
     with open(subtitle_file, "w", encoding="utf-8") as f:
         f.write(sub)
     logger.info(f"subtitle file created: {subtitle_file}")
+    return subtitle_file
 
 
 def file_to_subtitles(filename):

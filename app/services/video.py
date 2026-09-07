@@ -5,6 +5,7 @@ import random
 import gc
 import subprocess
 import sys
+import re
 import tempfile
 import unicodedata
 from contextlib import ExitStack, redirect_stdout
@@ -1161,6 +1162,162 @@ def _subtitle_font_supports_sample(font_path: str, sample: str) -> bool:
         return True
 
 
+def parse_karaoke_phrase(phrase: str, default_color: str = "#FFFFFF") -> list[tuple[str, str]]:
+    """
+    Parses a subtitle phrase with optional HTML font color tags into a list of (word, color).
+    Example:
+        '<font color="#FFDD00">Hello</font> world' -> [('Hello', '#FFDD00'), ('world', '#FFFFFF')]
+    """
+    pattern = re.compile(r'<font color="([^"]+)">([^<]+)</font>')
+    tokens: list[tuple[str, str]] = []
+    last_idx = 0
+    for match in pattern.finditer(phrase):
+        start, end = match.span()
+        if start > last_idx:
+            pre = phrase[last_idx:start].strip()
+            if pre:
+                for w in pre.split():
+                    tokens.append((w, default_color))
+        color = match.group(1)
+        word = match.group(2).strip()
+        if word:
+            for w in word.split():
+                tokens.append((w, color))
+        last_idx = end
+    if last_idx < len(phrase):
+        post = phrase[last_idx:].strip()
+        if post:
+            for w in post.split():
+                tokens.append((w, default_color))
+    if not tokens and phrase.strip():
+        tokens = [(w, default_color) for w in phrase.strip().split()]
+    return tokens
+
+
+def _render_karaoke_subtitle_clip(
+    tokens: list[tuple[str, str]],
+    font_path: str,
+    font_size: int,
+    stroke_color: str = "#000000",
+    stroke_width: int = 2,
+    max_width: int = 1000,
+    bg_color: str | None = None,
+    rounded_bg: bool = False,
+) -> ImageClip:
+    """
+    Renders word-highlighted karaoke subtitles onto a transparent ImageClip.
+    Supports individual word colors, outline stroke, and optional rounded background.
+    """
+    if not tokens:
+        empty = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        return ImageClip(np.array(empty), transparent=True)
+
+    font_size = max(12, int(font_size))
+    stroke_width = max(0, int(stroke_width))
+    max_width = max(100, int(max_width))
+
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except Exception as exc:
+        logger.warning(f"failed to load font for karaoke subtitle, fallback to default: {exc}")
+        font = ImageFont.load_default()
+
+    full_text = "".join(w for w, _ in tokens)
+    is_cjk_text = any(
+        "\u4e00" <= ch <= "\u9fff"
+        or "\u3040" <= ch <= "\u30ff"
+        or "\uac00" <= ch <= "\ud7af"
+        for ch in full_text
+    )
+
+    space_w = 0 if is_cjk_text else max(1, font.getbbox(" ")[2] - font.getbbox(" ")[0])
+
+    words_measured = []
+    for word, color in tokens:
+        bbox = font.getbbox(word)
+        w = max(1, bbox[2] - bbox[0])
+        words_measured.append((word, color, w))
+
+    lines: list[list[tuple[str, str, int]]] = [[]]
+    current_line_w = 0
+    for item in words_measured:
+        word, color, w = item
+        added_w = w if not lines[-1] else (space_w + w)
+        if lines[-1] and (current_line_w + added_w > max_width):
+            lines.append([item])
+            current_line_w = w
+        else:
+            lines[-1].append(item)
+            current_line_w += added_w
+
+    try:
+        ascent, descent = font.getmetrics()
+        line_height = max(1, ascent + descent)
+    except Exception:
+        line_height = max(1, font_size)
+
+    interline = int(font_size * 0.25)
+    line_count = len(lines)
+    text_total_h = line_height * line_count + interline * (line_count - 1)
+
+    pad_x = int(font_size * 0.45) if bg_color else int(font_size * 0.1)
+    pad_y = int(font_size * 0.3) if bg_color else int(font_size * 0.1)
+    margin_stroke = int(stroke_width * 2)
+
+    line_widths = [
+        sum(w for _, _, w in line) + space_w * (len(line) - 1)
+        for line in lines
+    ]
+    max_line_w = max(line_widths) if line_widths else 10
+
+    box_w = int(max_line_w + 2 * pad_x + 2 * margin_stroke)
+    box_h = int(text_total_h + 2 * pad_y + 2 * margin_stroke)
+
+    img = Image.new("RGBA", (box_w, box_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    if bg_color:
+        r, g, b = _hex_to_rgb(bg_color)
+        alpha = 180 if rounded_bg else 255
+        bg_fill = (r, g, b, alpha)
+        rect = [
+            margin_stroke,
+            margin_stroke,
+            box_w - margin_stroke,
+            box_h - margin_stroke,
+        ]
+        if rounded_bg:
+            radius = max(8, int(font_size * 0.4))
+            draw.rounded_rectangle(rect, radius=radius, fill=bg_fill)
+        else:
+            draw.rectangle(rect, fill=bg_fill)
+
+    cur_y = pad_y + margin_stroke
+    for line in lines:
+        line_w = sum(w for _, _, w in line) + space_w * (len(line) - 1)
+        cur_x = (box_w - line_w) // 2
+        for word, color, w in line:
+            r, g, b = _hex_to_rgb(color)
+            fill_color = (r, g, b, 255)
+            if stroke_width > 0:
+                sr, sg, sb = _hex_to_rgb(stroke_color)
+                stroke_fill = (sr, sg, sb, 255)
+                draw.text(
+                    (cur_x, cur_y),
+                    word,
+                    font=font,
+                    fill=fill_color,
+                    stroke_width=stroke_width,
+                    stroke_fill=stroke_fill,
+                )
+            else:
+                draw.text((cur_x, cur_y), word, font=font, fill=fill_color)
+            cur_x += w + space_w
+        cur_y += line_height + interline
+
+    return ImageClip(np.array(img), transparent=True)
+
+
 def subtitle_font_supports_text(font_path: str, text: str) -> bool:
     """检查字体能否绘制文本中的字母和数字，忽略空白及标点符号。"""
     sample = "".join(
@@ -1231,6 +1388,38 @@ def generate_video(
         rounded_bg_enabled = bool(
             getattr(params, "rounded_subtitle_background", False) and bg_color
         )
+
+        if "<font color=" in phrase:
+            tokens = parse_karaoke_phrase(phrase, default_color=params.text_fore_color or "#FFFFFF")
+            _clip = _render_karaoke_subtitle_clip(
+                tokens=tokens,
+                font_path=font_path,
+                font_size=params.font_size,
+                stroke_color=params.stroke_color or "#000000",
+                stroke_width=params.stroke_width,
+                max_width=int(max_width),
+                bg_color=bg_color,
+                rounded_bg=rounded_bg_enabled,
+            )
+            duration = subtitle_item[0][1] - subtitle_item[0][0]
+            _clip = _clip.with_start(subtitle_item[0][0])
+            _clip = _clip.with_end(subtitle_item[0][1])
+            _clip = _clip.with_duration(duration)
+            if params.subtitle_position == "bottom":
+                _clip = _clip.with_position(("center", video_height * 0.95 - _clip.h))
+            elif params.subtitle_position == "top":
+                _clip = _clip.with_position(("center", video_height * 0.05))
+            elif params.subtitle_position == "custom":
+                margin = 10
+                max_y = video_height - _clip.h - margin
+                min_y = margin
+                custom_y = (video_height - _clip.h) * (params.custom_position / 100)
+                custom_y = max(min_y, min(custom_y, max_y))
+                _clip = _clip.with_position(("center", custom_y))
+            else:  # center
+                _clip = _clip.with_position(("center", "center"))
+            return _clip
+
         has_subtitle_background = bool(bg_color)
         # 圆角背景按文字真实宽度生成，左右留白应更克制；旧矩形背景仍保留
         # 较大的安全边距，避免历史配置中的长字幕贴边或被裁切。

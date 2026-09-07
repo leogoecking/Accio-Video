@@ -330,6 +330,11 @@
     "AI Image Fallback Help": "Génère automatiquement des images IA avec mouvement cinématographique Ken Burns lorsqu'aucune vidéo de stock n'est trouvée.",
     "Review Draft (Storyboard before final render)": "Vérifier le brouillon (Storyboard avant le rendu)",
     "Review Draft Help": "Pause après génération du script et des médias pour réviser chaque scène avant le rendu final.",
-    "Rendering Final Video": "Rendu de la vidéo finale en cours..."
+    "Rendering Final Video": "Rendu de la vidéo finale en cours...",
+    "Subtitle Style": "Style de sous-titres",
+    "Classic (Sentence)": "Classique (Phrase)",
+    "Karaoke (Word Highlight)": "Karaoké (Surlignage des mots)",
+    "Word Highlight Color": "Couleur de surlignage du mot",
+    "Words per Chunk": "Mots par bloc"
   }
 }

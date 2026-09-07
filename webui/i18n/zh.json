@@ -395,6 +395,11 @@
     "AI Image Fallback Help": "当库存视频无匹配结果时，自动使用 AI 生成高清图像并转为电影级运镜视频片段。",
     "Review Draft (Storyboard before final render)": "分镜草稿审查 (渲染前逐幕确认)",
     "Review Draft Help": "生成文案、配音与素材后暂停，允许在最终合成前逐幕预览画面、微调字幕与替换素材。",
-    "Rendering Final Video": "正在渲染最终视频..."
+    "Rendering Final Video": "正在渲染最终视频...",
+    "Subtitle Style": "字幕风格",
+    "Classic (Sentence)": "经典整句",
+    "Karaoke (Word Highlight)": "动态卡拉OK (逐词高亮)",
+    "Word Highlight Color": "高亮词颜色",
+    "Words per Chunk": "每段词数"
   }
 }

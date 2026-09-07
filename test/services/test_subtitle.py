@@ -199,6 +199,103 @@ class TestSubtitleService(unittest.TestCase):
 
         self.assertEqual([item[2] for item in items], ["Hello", "World"])
 
+    def test_build_karaoke_subtitles_chunks_and_highlights_words(self):
+        """Karaoke 模式按指定词数切块，并逐词给当前词添加高亮颜色标签。"""
+        words = [
+            subtitle.SubtitleWord("O", 0.0, 0.4),
+            subtitle.SubtitleWord("futuro", 0.4, 0.9),
+            subtitle.SubtitleWord("começa", 0.9, 1.5),
+            subtitle.SubtitleWord("hoje", 1.5, 2.0),
+        ]
+        subs, srt_content = subtitle.build_karaoke_subtitles(
+            words, highlight_color="#FFDD00", max_words=3
+        )
+        self.assertEqual(len(subs), 4)
+        # 第一块前 3 个词
+        self.assertIn('<font color="#FFDD00">O</font> futuro começa', subs[0]["msg"])
+        self.assertIn('O <font color="#FFDD00">futuro</font> começa', subs[1]["msg"])
+        self.assertIn('O futuro <font color="#FFDD00">começa</font>', subs[2]["msg"])
+        # 第二块第 4 个词
+        self.assertIn('<font color="#FFDD00">hoje</font>', subs[3]["msg"])
+        self.assertIn("00:00:00,000 --> 00:00:00,400", srt_content)
+
+    def test_build_karaoke_subtitles_handles_punctuation_break(self):
+        """遇到标点符号时提前切块，保证断句节奏符合语意。"""
+        words = [
+            subtitle.SubtitleWord("Olá,", 0.0, 0.5),
+            subtitle.SubtitleWord("mundo", 0.5, 1.0),
+            subtitle.SubtitleWord("digital", 1.0, 1.6),
+        ]
+        subs, _ = subtitle.build_karaoke_subtitles(
+            words, highlight_color="#00FFFF", max_words=3
+        )
+        self.assertEqual(len(subs), 3)
+        self.assertEqual(subs[0]["msg"], '<font color="#00FFFF">Olá,</font>')
+        self.assertEqual(subs[1]["msg"], '<font color="#00FFFF">mundo</font> digital')
+        self.assertEqual(subs[2]["msg"], 'mundo <font color="#00FFFF">digital</font>')
+
+    def test_build_karaoke_subtitles_handles_empty_input(self):
+        """空单词列表应安全返回空列表与空字符串。"""
+        subs, srt = subtitle.build_karaoke_subtitles([])
+        self.assertEqual(subs, [])
+        self.assertEqual(srt, "")
+
+    def test_write_ass_subtitles_generates_valid_ass_file(self):
+        """ASS 导出应生成包含 Karaoke 样式和 \\k 标签的标准字幕文件。"""
+        words = [
+            subtitle.SubtitleWord("Hello", 0.0, 0.5),
+            subtitle.SubtitleWord("world", 0.5, 1.2),
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            ass_path = Path(tmp_dir) / "sub.ass"
+            subtitle.write_ass_subtitles(
+                words=words,
+                ass_file=str(ass_path),
+                font_name="Arial",
+                font_size=60,
+                primary_color="#FFFFFF",
+                highlight_color="#FFDD00",
+            )
+            self.assertTrue(ass_path.exists())
+            content = ass_path.read_text(encoding="utf-8")
+            self.assertIn("[Script Info]", content)
+            self.assertIn("Style: Karaoke", content)
+            self.assertIn(r"{\k50}Hello", content)
+            self.assertIn(r"{\k70}world", content)
+
+    def test_create_with_karaoke_style_generates_both_srt_and_ass(self):
+        """create 传入 subtitle_style='karaoke' 时应同时生成带有高亮标签的 .srt 与 .ass 文件。"""
+        class _FakeWhisperModel:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def transcribe(self, audio_file, **kwargs):
+                words = [
+                    SimpleNamespace(start=0.0, end=0.5, word="Smart"),
+                    SimpleNamespace(start=0.5, end=1.0, word="video"),
+                ]
+                segment = SimpleNamespace(start=0.0, end=1.0, words=words)
+                info = SimpleNamespace(language="en", language_probability=0.99)
+                return [segment], info
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            srt_path = Path(tmp_dir) / "output.srt"
+            with patch.object(subtitle, "model", None), patch.object(
+                subtitle, "WhisperModel", _FakeWhisperModel
+            ):
+                subtitle.create(
+                    audio_file="audio.mp3",
+                    subtitle_file=str(srt_path),
+                    subtitle_style="karaoke",
+                    karaoke_highlight_color="#FFDD00",
+                )
+
+            self.assertTrue(srt_path.exists())
+            ass_path = Path(tmp_dir) / "output.ass"
+            self.assertTrue(ass_path.exists())
+            srt_text = srt_path.read_text(encoding="utf-8")
+            self.assertIn('<font color="#FFDD00">Smart</font>', srt_text)
+
 
 if __name__ == "__main__":
     unittest.main()

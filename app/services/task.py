@@ -586,10 +586,21 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         )
         return ""
 
+    subtitle_style = getattr(params, "subtitle_style", "classic") or "classic"
+    karaoke_highlight_color = getattr(params, "karaoke_highlight_color", "#FFDD00") or "#FFDD00"
+    karaoke_max_words = getattr(params, "karaoke_max_words", 3) or 3
+
     if subtitle_provider == "edge":
-        voice.create_subtitle(
-            text=video_script, sub_maker=sub_maker, subtitle_file=subtitle_path
-        )
+        edge_kwargs = {
+            "text": video_script,
+            "sub_maker": sub_maker,
+            "subtitle_file": subtitle_path,
+        }
+        if subtitle_style == "karaoke":
+            edge_kwargs["subtitle_style"] = subtitle_style
+            edge_kwargs["karaoke_highlight_color"] = karaoke_highlight_color
+            edge_kwargs["karaoke_max_words"] = karaoke_max_words
+        voice.create_subtitle(**edge_kwargs)
         if not os.path.exists(subtitle_path):
             # Edge 字幕偶尔会因为时间轴与文案无法匹配而没有产出文件。这里不能
             # 自动切换到 Whisper，否则首次失败会在用户不知情的情况下下载数 GB
@@ -602,9 +613,18 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
             return ""
 
     if subtitle_provider == "whisper":
-        subtitle.create(audio_file=audio_file, subtitle_file=subtitle_path)
-        logger.info("\n\n## correcting subtitle")
-        subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
+        whisper_kwargs = {
+            "audio_file": audio_file,
+            "subtitle_file": subtitle_path,
+        }
+        if subtitle_style == "karaoke":
+            whisper_kwargs["subtitle_style"] = subtitle_style
+            whisper_kwargs["karaoke_highlight_color"] = karaoke_highlight_color
+            whisper_kwargs["karaoke_max_words"] = karaoke_max_words
+        subtitle.create(**whisper_kwargs)
+        if subtitle_style != "karaoke":
+            logger.info("\n\n## correcting subtitle")
+            subtitle.correct(subtitle_file=subtitle_path, video_script=video_script)
 
     subtitle_lines = subtitle.file_to_subtitles(subtitle_path)
     if not subtitle_lines:

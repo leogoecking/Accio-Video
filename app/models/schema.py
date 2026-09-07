@@ -124,6 +124,9 @@ class VideoParams(BaseModel):
     font_size: int = 60
     stroke_color: Optional[str] = "#000000"
     stroke_width: float = 1.5
+    subtitle_style: Optional[str] = "classic"
+    karaoke_highlight_color: Optional[str] = "#FFDD00"
+    karaoke_max_words: Optional[int] = 3
     n_threads: Optional[int] = 2
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
@@ -147,6 +150,9 @@ class SubtitleRequest(BaseModel):
     font_size: int = 60
     stroke_color: Optional[str] = "#000000"
     stroke_width: float = 1.5
+    subtitle_style: Optional[str] = "classic"
+    karaoke_highlight_color: Optional[str] = "#FFDD00"
+    karaoke_max_words: Optional[int] = 3
     video_source: Optional[str] = "local"
     subtitle_enabled: Optional[str] = "true"
 

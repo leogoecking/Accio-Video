@@ -330,6 +330,11 @@
     "AI Image Fallback Help": "Secara otomatis menghasilkan gambar AI dengan gerakan sinematik Ken Burns saat tidak ada video stok yang cocok.",
     "Review Draft (Storyboard before final render)": "Tinjau Draf (Storyboard sebelum render final)",
     "Review Draft Help": "Jeda setelah pembuatan skrip, sulih suara, dan materi untuk meninjau adegan sebelum render akhir.",
-    "Rendering Final Video": "Merender video akhir..."
+    "Rendering Final Video": "Merender video akhir...",
+    "Subtitle Style": "Gaya Subtitel",
+    "Classic (Sentence)": "Klasik (Kalimat)",
+    "Karaoke (Word Highlight)": "Karaoke (Sorotan Kata)",
+    "Word Highlight Color": "Warna Sorotan Kata",
+    "Words per Chunk": "Kata per Blok"
   }
 }

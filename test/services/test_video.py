@@ -1381,6 +1381,106 @@ class TestVideoService(unittest.TestCase):
                     result = vd._get_temp_audio_dir("/some/output/dir")
                     self.assertEqual(result, "/some/output/dir")
 
+    def test_parse_karaoke_phrase(self):
+        # Tagged phrase
+        phrase1 = '<font color="#FFDD00">Hello</font> world'
+        tokens1 = vd.parse_karaoke_phrase(phrase1, default_color="#FFFFFF")
+        self.assertEqual(tokens1, [("Hello", "#FFDD00"), ("world", "#FFFFFF")])
+
+        # Multiple tagged words
+        phrase2 = '<font color="#FFDD00">One</font> <font color="#00FF00">Two</font> Three'
+        tokens2 = vd.parse_karaoke_phrase(phrase2, default_color="#FFFFFF")
+        self.assertEqual(
+            tokens2,
+            [("One", "#FFDD00"), ("Two", "#00FF00"), ("Three", "#FFFFFF")],
+        )
+
+        # Plain untagged phrase
+        tokens3 = vd.parse_karaoke_phrase("Plain text phrase", default_color="#E0E0E0")
+        self.assertEqual(
+            tokens3,
+            [("Plain", "#E0E0E0"), ("text", "#E0E0E0"), ("phrase", "#E0E0E0")],
+        )
+
+        # Empty phrase
+        self.assertEqual(vd.parse_karaoke_phrase(""), [])
+        self.assertEqual(vd.parse_karaoke_phrase("   "), [])
+
+    def test_render_karaoke_subtitle_clip(self):
+        # Empty tokens returns minimal transparent clip
+        empty_clip = vd._render_karaoke_subtitle_clip([], font_path="", font_size=20)
+        try:
+            self.assertEqual(empty_clip.w, 1)
+            self.assertEqual(empty_clip.h, 1)
+        finally:
+            empty_clip.close()
+
+        # Valid tokens with styling and rounded background
+        font_path = os.path.join(utils.font_dir(), "STHeitiMedium.ttc")
+        tokens = [("Hello", "#FFDD00"), ("World", "#FFFFFF")]
+        clip = vd._render_karaoke_subtitle_clip(
+            tokens=tokens,
+            font_path=font_path,
+            font_size=24,
+            stroke_color="#000000",
+            stroke_width=2,
+            max_width=400,
+            bg_color="#000000",
+            rounded_bg=True,
+        )
+        try:
+            self.assertGreater(clip.w, 10)
+            self.assertGreater(clip.h, 10)
+            self.assertIsNotNone(clip.mask)
+        finally:
+            clip.close()
+
+    def test_render_karaoke_subtitle_clip_multiline_and_cjk(self):
+        font_path = os.path.join(utils.font_dir(), "STHeitiMedium.ttc")
+
+        # Multi-line wrapping when words exceed max_width
+        long_tokens = [
+            ("The", "#FFDD00"),
+            ("quick", "#FFFFFF"),
+            ("brown", "#FFFFFF"),
+            ("fox", "#FFFFFF"),
+            ("jumps", "#FFFFFF"),
+            ("over", "#FFFFFF"),
+        ]
+        single_line_clip = vd._render_karaoke_subtitle_clip(
+            tokens=long_tokens[:2],
+            font_path=font_path,
+            font_size=28,
+            max_width=800,
+        )
+        wrapped_clip = vd._render_karaoke_subtitle_clip(
+            tokens=long_tokens,
+            font_path=font_path,
+            font_size=28,
+            max_width=120,
+        )
+        try:
+            # Wrapped multi-line clip must be taller than single-line clip
+            self.assertGreater(wrapped_clip.h, single_line_clip.h)
+        finally:
+            single_line_clip.close()
+            wrapped_clip.close()
+
+        # CJK characters
+        cjk_tokens = [("智能", "#FFDD00"), ("剪辑", "#FFFFFF")]
+        cjk_clip = vd._render_karaoke_subtitle_clip(
+            tokens=cjk_tokens,
+            font_path=font_path,
+            font_size=32,
+            stroke_color="#111111",
+            stroke_width=3,
+        )
+        try:
+            self.assertGreater(cjk_clip.w, 20)
+            self.assertGreater(cjk_clip.h, 20)
+        finally:
+            cjk_clip.close()
+
 
 class TestMaterialResolutionTolerance(unittest.TestCase):
     def test_accepts_material_at_the_nominal_minimum(self):

@@ -2154,7 +2154,14 @@ def _build_subtitle_items_from_legacy_submaker(
     return sub_items
 
 
-def create_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str):
+def create_subtitle(
+    sub_maker: SubMaker,
+    text: str,
+    subtitle_file: str,
+    subtitle_style: str = "classic",
+    karaoke_highlight_color: str = "#FFDD00",
+    karaoke_max_words: int = 3,
+):
     """
     优化字幕文件
     1. 将字幕文件按照标点符号分割成多行
@@ -2162,6 +2169,52 @@ def create_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str):
     3. 生成新的字幕文件
     """
     text = _format_text(text)
+    if subtitle_style == "karaoke" and hasattr(sub_maker, "cues") and sub_maker.cues:
+        try:
+            from app.services import subtitle as sub_svc
+
+            words = []
+            for cue in sub_maker.cues:
+                cue_text = unescape(cue.content).strip()
+                if cue_text:
+                    words.append(
+                        sub_svc.SubtitleWord(
+                            word=cue_text,
+                            start=cue.start.total_seconds(),
+                            end=cue.end.total_seconds(),
+                        )
+                    )
+            if words:
+                is_cjk = any(
+                    "\u4e00" <= ch <= "\u9fff"
+                    or "\u3040" <= ch <= "\u30ff"
+                    or "\uac00" <= ch <= "\ud7af"
+                    for ch in text
+                )
+                _, srt_content = sub_svc.build_karaoke_subtitles(
+                    words=words,
+                    highlight_color=karaoke_highlight_color,
+                    max_words=karaoke_max_words,
+                    is_cjk_lang=is_cjk,
+                )
+                ensure_file_path_exists(subtitle_file)
+                with open(subtitle_file, "w", encoding="utf-8") as f:
+                    f.write(srt_content)
+                try:
+                    ass_file = os.path.splitext(subtitle_file)[0] + ".ass"
+                    sub_svc.write_ass_subtitles(
+                        words=words,
+                        ass_file=ass_file,
+                        highlight_color=karaoke_highlight_color,
+                        max_words=karaoke_max_words,
+                        is_cjk_lang=is_cjk,
+                    )
+                except Exception as ass_err:
+                    logger.debug(f"failed to export ASS subtitles: {ass_err}")
+                return
+        except Exception as exc:
+            logger.warning(f"failed to generate karaoke subtitles from cues: {exc}, fallback to classic")
+
     script_lines = utils.split_string_by_punctuations(text)
     try:
         if hasattr(sub_maker, "cues") and sub_maker.cues:

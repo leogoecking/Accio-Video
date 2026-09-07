@@ -330,6 +330,11 @@
     "AI Image Fallback Help": "Eşleşen stok video bulunamadığında otomatik olarak sinematik Ken Burns hareketli yapay zeka görselleri oluşturur.",
     "Review Draft (Storyboard before final render)": "Taslağı İncele (Oluşturmadan önce Storyboard)",
     "Review Draft Help": "Son render işleminden önce sahneleri inceleyebilmeniz için seslendirme ve materyallerden sonra duraklar.",
-    "Rendering Final Video": "Nihai video işleniyor..."
+    "Rendering Final Video": "Nihai video işleniyor...",
+    "Subtitle Style": "Altyazı Stili",
+    "Classic (Sentence)": "Klasik (Cümle)",
+    "Karaoke (Word Highlight)": "Karaoke (Kelime Vurgulama)",
+    "Word Highlight Color": "Kelime Vurgu Rengi",
+    "Words per Chunk": "Öbek Başına Kelime"
   }
 }

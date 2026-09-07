@@ -882,6 +882,59 @@ class TestTaskService(unittest.TestCase):
             subtitle_file=subtitle_path, video_script="Hello world."
         )
 
+    def test_generate_subtitle_passes_karaoke_parameters_to_whisper_and_skips_correct(self):
+        """Karaoke 模式下应透传样式参数给 whisper 且跳过 sentence-level 的 correct 阶段。"""
+        task_id = "test-karaoke-whisper-subtitle"
+        task_dir = utils.task_dir(task_id)
+        audio_file = os.path.join(task_dir, "custom-audio.mp3")
+        Path(audio_file).write_bytes(b"fake audio")
+        params = VideoParams(
+            video_subject="custom audio",
+            video_script="Hello world.",
+            subtitle_enabled=True,
+            subtitle_style="karaoke",
+            karaoke_highlight_color="#00FF00",
+            karaoke_max_words=2,
+        )
+
+        def fake_whisper_create(audio_file, subtitle_file, **kwargs):
+            Path(subtitle_file).write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n<font color=\"#00FF00\">Hello</font> world.\n\n",
+                encoding="utf-8",
+            )
+
+        try:
+            with (
+                patch.object(
+                    tm.config,
+                    "app",
+                    dict(tm.config.app, subtitle_provider="whisper"),
+                ),
+                patch.object(
+                    tm.subtitle, "create", side_effect=fake_whisper_create
+                ) as create,
+                patch.object(tm.subtitle, "correct") as correct,
+            ):
+                subtitle_path = tm.generate_subtitle(
+                    task_id=task_id,
+                    params=params,
+                    video_script="Hello world.",
+                    sub_maker=None,
+                    audio_file=audio_file,
+                )
+        finally:
+            shutil.rmtree(task_dir, ignore_errors=True)
+
+        self.assertTrue(subtitle_path.endswith("subtitle.srt"))
+        create.assert_called_once_with(
+            audio_file=audio_file,
+            subtitle_file=subtitle_path,
+            subtitle_style="karaoke",
+            karaoke_highlight_color="#00FF00",
+            karaoke_max_words=2,
+        )
+        correct.assert_not_called()
+
     def test_generate_subtitle_skips_edge_provider_without_sub_maker(self):
         """
         Edge 字幕依赖 TTS 返回的 sub_maker 时间轴。

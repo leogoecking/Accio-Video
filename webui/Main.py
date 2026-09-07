@@ -114,6 +114,9 @@ DEFAULT_SUBTITLE_SETTINGS = {
     "subtitle_background_enabled": False,
     "subtitle_background_color": "#000000",
     "rounded_subtitle_background": False,
+    "subtitle_style": "classic",
+    "karaoke_highlight_color": "#FFDD00",
+    "karaoke_max_words": 3,
 }
 LOCAL_MATERIAL_EXTENSIONS = {
     ".mp4",
@@ -1316,6 +1319,15 @@ def _apply_restored_params(params):
     st.session_state["rounded_subtitle_background_checkbox"] = bool(
         params.get("rounded_subtitle_background", False) and background_enabled
     )
+    _set_stable_widget_value(
+        "subtitle_style_select", params.get("subtitle_style") or "classic"
+    )
+    st.session_state["karaoke_highlight_color_picker"] = (
+        params.get("karaoke_highlight_color") or "#FFDD00"
+    )
+    st.session_state["karaoke_max_words_slider"] = min(
+        6, max(1, int(params.get("karaoke_max_words", 3)))
+    )
 
     st.session_state.pop("local_video_materials_uploader", None)
     # 历史任务只保存素材路径，不能保证这些文件在当前环境仍然存在。
@@ -2054,6 +2066,11 @@ def reset_subtitle_settings():
     st.session_state["rounded_subtitle_background_checkbox"] = defaults[
         "rounded_subtitle_background"
     ]
+    _set_stable_widget_value("subtitle_style_select", defaults["subtitle_style"])
+    st.session_state["karaoke_highlight_color_picker"] = defaults[
+        "karaoke_highlight_color"
+    ]
+    st.session_state["karaoke_max_words_slider"] = defaults["karaoke_max_words"]
 
     # 同步会持久化的 UI 选项，确保恢复后刷新页面仍保持默认设置。
     for key in (
@@ -2068,6 +2085,9 @@ def reset_subtitle_settings():
         "subtitle_background_enabled",
         "subtitle_background_color",
         "rounded_subtitle_background",
+        "subtitle_style",
+        "karaoke_highlight_color",
+        "karaoke_max_words",
     ):
         _set_runtime_config("ui", key, defaults[key])
 
@@ -5447,6 +5467,69 @@ def _render_subtitle_settings(panel, params):
                         )
                 except ValueError:
                     st.error(tr("Please enter a valid number"))
+
+            subtitle_styles = [
+                (tr("Classic (Sentence)"), "classic"),
+                (tr("Karaoke (Word Highlight)"), "karaoke"),
+            ]
+            saved_subtitle_style = config.ui.get(
+                "subtitle_style", DEFAULT_SUBTITLE_SETTINGS["subtitle_style"]
+            )
+            saved_style_index = 0
+            for i, (_, style_val) in enumerate(subtitle_styles):
+                if style_val == saved_subtitle_style:
+                    saved_style_index = i
+                    break
+            selected_subtitle_style = stable_selectbox(
+                tr("Subtitle Style"),
+                options=[val for _, val in subtitle_styles],
+                default_value=subtitle_styles[saved_style_index][1],
+                key="subtitle_style_select",
+                format_func=lambda val: dict(
+                    (v, label) for label, v in subtitle_styles
+                ).get(val, val),
+                disabled=subtitle_settings_disabled,
+            )
+            params.subtitle_style = selected_subtitle_style
+            _set_runtime_config("ui", "subtitle_style", params.subtitle_style)
+
+            if params.subtitle_style == "karaoke":
+                karaoke_cols = st.columns([0.42, 0.58])
+                with karaoke_cols[0]:
+                    saved_highlight_color = config.ui.get(
+                        "karaoke_highlight_color",
+                        DEFAULT_SUBTITLE_SETTINGS["karaoke_highlight_color"],
+                    )
+                    st.session_state.setdefault(
+                        "karaoke_highlight_color_picker", saved_highlight_color
+                    )
+                    params.karaoke_highlight_color = st.color_picker(
+                        tr("Word Highlight Color"),
+                        key="karaoke_highlight_color_picker",
+                        disabled=subtitle_settings_disabled,
+                    )
+                    _set_runtime_config(
+                        "ui", "karaoke_highlight_color", params.karaoke_highlight_color
+                    )
+
+                with karaoke_cols[1]:
+                    saved_max_words = config.ui.get(
+                        "karaoke_max_words",
+                        DEFAULT_SUBTITLE_SETTINGS["karaoke_max_words"],
+                    )
+                    st.session_state.setdefault(
+                        "karaoke_max_words_slider", int(saved_max_words)
+                    )
+                    params.karaoke_max_words = st.slider(
+                        tr("Words per Chunk"),
+                        min_value=1,
+                        max_value=6,
+                        key="karaoke_max_words_slider",
+                        disabled=subtitle_settings_disabled,
+                    )
+                    _set_runtime_config(
+                        "ui", "karaoke_max_words", params.karaoke_max_words
+                    )
 
             # 非中文语言的颜色标签通常比中文更长。为颜色选择器保留适当宽度，
             # 避免标签换行，同时仍给字号滑块保留足够的可操作空间。
