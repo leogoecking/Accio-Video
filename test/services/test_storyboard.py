@@ -272,6 +272,40 @@ class TestStoryboardComponent(unittest.TestCase):
         self.assertEqual(task.get("state"), const.TASK_STATE_PROCESSING)
         self.assertEqual(task.get("progress"), 65)
 
+    def test_webui_task_submit_draft_final_render_without_params(self):
+        import json
+        from app.models import const
+        from app.services import state as sm
+        from app.services import webui_task
+
+        task_id = "test_webui_submit_draft_no_params"
+        # Task in state has no params
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_DRAFT_READY,
+            progress=60,
+        )
+
+        script_data = {
+            "script": "Some script",
+            "params": {"video_subject": "Recovered Subject", "video_aspect": "9:16"},
+        }
+        with open(os.path.join(self.temp_dir.name, "script.json"), "w", encoding="utf-8") as f:
+            json.dump(script_data, f)
+
+        with (
+            patch("app.utils.utils.task_dir", return_value=self.temp_dir.name),
+            patch.object(webui_task._task_manager, "add_task") as mock_add_task,
+        ):
+            webui_task.submit_draft_final_render(task_id)
+
+        mock_add_task.assert_called_once()
+        passed_params = mock_add_task.call_args.kwargs["params"]
+        self.assertEqual(passed_params.video_subject, "Recovered Subject")
+        task = sm.state.get_task(task_id)
+        self.assertEqual(task.get("state"), const.TASK_STATE_PROCESSING)
+        self.assertEqual(task.get("progress"), 65)
+
     def test_render_final_from_draft_recovers_when_task_not_in_state(self):
         import json
         from app.models import const

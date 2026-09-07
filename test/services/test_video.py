@@ -888,6 +888,160 @@ class TestVideoService(unittest.TestCase):
         self.assertEqual(command[command.index("-t") + 1], "10.000")
         self.assertLess(command.index("-t"), command.index(output_file))
 
+    def test_concat_video_clips_supports_fps_and_default_output_dir(self):
+        """concat_video_clips_with_ffmpeg 支持 fps 传参且 output_dir 可缺省。"""
+
+        def fake_run(command, capture_output, text, check):
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            clip_file = os.path.join(temp_dir, "clip.mp4")
+            output_file = os.path.join(temp_dir, "combined.mp4")
+            Path(clip_file).write_bytes(b"fake")
+
+            with patch.object(vd.subprocess, "run", side_effect=fake_run) as run:
+                vd.concat_video_clips_with_ffmpeg(
+                    clip_files=[clip_file],
+                    output_file=output_file,
+                    threads=2,
+                    fps=30,
+                )
+
+        command = run.call_args.args[0]
+        self.assertIn("-r", command)
+        self.assertEqual(command[command.index("-r") + 1], "30")
+
+    def test_combine_videos_storyboard_mode_calls_concat_properly(self):
+        """storyboard 分镜模式应按精确时长渲染并正确传递参数给 concat_video_clips_with_ffmpeg。"""
+        class _FakeAudioClip:
+            def __init__(self, duration=6.0):
+                self.duration = duration
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            combined_video_path = os.path.join(temp_dir, "combined.mp4")
+            video_1 = os.path.join(temp_dir, "scene1.mp4")
+            video_2 = os.path.join(temp_dir, "scene2.mp4")
+            Path(video_1).write_bytes(b"fake1")
+            Path(video_2).write_bytes(b"fake2")
+
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip(duration=6.0)),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    return_value=types.SimpleNamespace(duration=5.0, close=lambda: None),
+                ),
+                patch.object(vd.ffmpeg_video, "render_subclip_with_ffmpeg", return_value=True),
+                patch.object(vd.os.path, "isfile", return_value=True),
+                patch.object(vd.os.path, "getsize", return_value=100),
+                patch.object(vd, "concat_video_clips_with_ffmpeg") as concat_mock,
+                patch.object(vd, "delete_files") as delete_mock,
+            ):
+                result = vd.combine_videos(
+                    combined_video_path=combined_video_path,
+                    video_paths=[video_1, video_2],
+                    audio_file=os.path.join(temp_dir, "audio.mp3"),
+                    scene_durations=[3.0, 3.0],
+                    fps=30,
+                )
+
+            self.assertEqual(result, combined_video_path)
+            concat_mock.assert_called_once()
+            self.assertEqual(concat_mock.call_args.kwargs["output_dir"], temp_dir)
+            self.assertEqual(concat_mock.call_args.kwargs["fps"], 30)
+            self.assertEqual(concat_mock.call_args.kwargs["max_duration"], 6.0)
+            delete_mock.assert_called_once()
+
+    def test_combine_videos_storyboard_mode_cleans_up_clips_on_failure(self):
+        """storyboard 分镜模式即使拼接失败，也必须确保清理临时片段。"""
+        class _FakeAudioClip:
+            def __init__(self, duration=6.0):
+                self.duration = duration
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            combined_video_path = os.path.join(temp_dir, "combined.mp4")
+            video_1 = os.path.join(temp_dir, "scene1.mp4")
+            video_2 = os.path.join(temp_dir, "scene2.mp4")
+            Path(video_1).write_bytes(b"fake1")
+            Path(video_2).write_bytes(b"fake2")
+
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip(duration=6.0)),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    return_value=types.SimpleNamespace(duration=5.0, close=lambda: None),
+                ),
+                patch.object(vd.ffmpeg_video, "render_subclip_with_ffmpeg", return_value=True),
+                patch.object(vd.os.path, "isfile", return_value=True),
+                patch.object(vd.os.path, "getsize", return_value=100),
+                patch.object(
+                    vd,
+                    "concat_video_clips_with_ffmpeg",
+                    side_effect=RuntimeError("ffmpeg concat failed"),
+                ),
+                patch.object(vd, "delete_files") as delete_mock,
+            ):
+                with self.assertRaises(RuntimeError):
+                    vd.combine_videos(
+                        combined_video_path=combined_video_path,
+                        video_paths=[video_1, video_2],
+                        audio_file=os.path.join(temp_dir, "audio.mp3"),
+                        scene_durations=[3.0, 3.0],
+                        fps=30,
+                    )
+
+            delete_mock.assert_called_once()
+
+    def test_combine_videos_standard_mode_cleans_up_clips_on_failure(self):
+        """标准模式即使拼接失败，也必须确保清理临时片段，并透传 fps。"""
+        class _FakeAudioClip:
+            def __init__(self, duration=4.0):
+                self.duration = duration
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            combined_video_path = os.path.join(temp_dir, "combined.mp4")
+            video_1 = os.path.join(temp_dir, "clip1.mp4")
+            Path(video_1).write_bytes(b"fake1")
+
+            with (
+                patch.object(vd, "AudioFileClip", return_value=_FakeAudioClip(duration=4.0)),
+                patch.object(
+                    vd,
+                    "_open_video_clip_quietly",
+                    return_value=types.SimpleNamespace(duration=5.0, size=(1080, 1920), close=lambda: None),
+                ),
+                patch.object(vd.ffmpeg_video, "render_subclip_with_ffmpeg", return_value=True),
+                patch.object(vd.os.path, "isfile", return_value=True),
+                patch.object(vd.os.path, "getsize", return_value=100),
+                patch.object(
+                    vd,
+                    "concat_video_clips_with_ffmpeg",
+                    side_effect=RuntimeError("ffmpeg concat failed"),
+                ) as concat_mock,
+                patch.object(vd, "delete_files") as delete_mock,
+            ):
+                with self.assertRaises(RuntimeError):
+                    vd.combine_videos(
+                        combined_video_path=combined_video_path,
+                        video_paths=[video_1],
+                        audio_file=os.path.join(temp_dir, "audio.mp3"),
+                        fps=30,
+                    )
+
+            concat_mock.assert_called_once()
+            self.assertEqual(concat_mock.call_args.kwargs["fps"], 30)
+            delete_mock.assert_called_once()
+
     def test_prioritize_unique_source_clips_uses_each_source_before_reuse(self):
         """
         随机模式下，一个长素材会被拆成多个片段。调度层应先让每个源素材

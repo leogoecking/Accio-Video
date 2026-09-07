@@ -1814,15 +1814,26 @@ def _render_current_generation_task():
         if os.path.isfile(draft_file):
             video_file = _find_final_task_video(task_dir_path)
             if not video_file:
+                script_file = os.path.join(task_dir_path, "script.json")
+                loaded_params = {}
+                if os.path.isfile(script_file):
+                    try:
+                        with open(script_file, "r", encoding="utf-8") as sf:
+                            data = json.load(sf)
+                            loaded_params = data.get("params") or {}
+                    except Exception:
+                        loaded_params = {}
                 task = {
                     "task_id": task_id,
                     "state": getattr(const, "TASK_STATE_DRAFT_READY", 2),
                     "progress": 60,
+                    "params": loaded_params,
                 }
                 sm.state.update_task(
                     task_id,
                     state=task["state"],
                     progress=task["progress"],
+                    params=loaded_params,
                 )
 
     state = _normalize_task_state((task or {}).get("state"))

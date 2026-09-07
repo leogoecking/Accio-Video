@@ -49,6 +49,11 @@ def _write_json_atomic(target: Path, payload: Mapping[str, Any]) -> None:
             temp_file.flush()
             os.fsync(temp_file.fileno())
 
+        try:
+            os.chmod(temp_path, 0o644)
+        except OSError:
+            pass
+
         os.replace(temp_path, target)
         temp_path = None
     finally:

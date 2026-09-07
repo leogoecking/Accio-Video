@@ -1570,8 +1570,27 @@ def render_final_from_draft(
         }
 
     if params is None:
-        raw_params = current_task.get("params") or {}
-        params = VideoParams.model_validate(raw_params)
+        raw_params = current_task.get("params")
+        if not raw_params or not isinstance(raw_params, (dict, VideoParams)):
+            script_file = os.path.join(task_dir_path, "script.json")
+            if os.path.isfile(script_file):
+                try:
+                    with open(script_file, "r", encoding="utf-8") as sf:
+                        data = json.load(sf)
+                        raw_params = data.get("params")
+                except Exception as exc:
+                    logger.warning(f"failed to read params from script.json: {exc}")
+
+        if isinstance(raw_params, VideoParams):
+            params = raw_params.model_copy(deep=True)
+        elif isinstance(raw_params, dict) and raw_params:
+            candidate_dict = dict(raw_params)
+            if not candidate_dict.get("video_subject") and draft and draft.video_subject:
+                candidate_dict["video_subject"] = draft.video_subject
+            params = VideoParams.model_validate(candidate_dict)
+        else:
+            subject = (draft.video_subject if draft else "") or "Video"
+            params = VideoParams(video_subject=subject)
 
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=70)
 

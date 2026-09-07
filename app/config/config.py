@@ -466,6 +466,10 @@ def load_config():
         example_file = f"{root_dir}/config.example.toml"
         if os.path.isfile(example_file):
             shutil.copyfile(example_file, config_file)
+            try:
+                os.chmod(config_file, 0o600)
+            except OSError:
+                pass
             logger.info("copy config.example.toml to config.toml")
 
     logger.info(f"load config from file: {config_file}")
@@ -512,6 +516,13 @@ def save_config():
         except (OSError, UnicodeError):
             pass
 
+        orig_stat = None
+        if os.path.exists(config_file):
+            try:
+                orig_stat = os.stat(config_file)
+            except OSError:
+                pass
+
         temp_path = ""
         try:
             fd, temp_path = tempfile.mkstemp(
@@ -524,9 +535,15 @@ def save_config():
                 f.flush()
                 os.fsync(f.fileno())
             try:
-                os.chmod(temp_path, 0o666)
+                os.chmod(temp_path, 0o600)
             except OSError:
                 pass
+            if orig_stat and hasattr(os, "chown") and hasattr(os, "geteuid"):
+                try:
+                    if os.geteuid() == 0 and (orig_stat.st_uid != 0 or orig_stat.st_gid != 0):
+                        os.chown(temp_path, orig_stat.st_uid, orig_stat.st_gid)
+                except OSError:
+                    pass
             try:
                 os.replace(temp_path, config_file)
             except OSError as exc:
@@ -541,11 +558,24 @@ def save_config():
                     f.write(serialized_config)
                     f.flush()
                     os.fsync(f.fileno())
+                try:
+                    os.chmod(config_file, 0o600)
+                except OSError:
+                    pass
+                if orig_stat and hasattr(os, "chown") and hasattr(os, "geteuid"):
+                    try:
+                        if os.geteuid() == 0 and (orig_stat.st_uid != 0 or orig_stat.st_gid != 0):
+                            os.chown(config_file, orig_stat.st_uid, orig_stat.st_gid)
+                    except OSError:
+                        pass
             _cfg.clear()
             _cfg.update(config_to_save)
         finally:
             if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
 
 _cfg = load_config()

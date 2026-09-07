@@ -1,4 +1,6 @@
 import errno
+import os
+import stat
 import threading
 import time
 import tomllib
@@ -144,6 +146,8 @@ class TestConfigPersistence:
                 saved_config = tomllib.loads(config_path.read_text(encoding="utf-8"))
                 assert saved_config["app"]["atomic_save_test"] == "ok"
                 assert list(Path(temp_dir).glob(".config-*.toml.tmp")) == []
+                if os.name != "nt":
+                    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
         finally:
             config.app.clear()
             config.app.update(original_app)
@@ -182,6 +186,56 @@ class TestConfigPersistence:
                 assert saved_config["app"]["bind_mount_save_test"] == "ok"
                 assert list(Path(temp_dir).glob(".config-*.toml.tmp")) == []
                 warning_mock.assert_called_once()
+                if os.name != "nt":
+                    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+        finally:
+            config.app.clear()
+            config.app.update(original_app)
+            config._cfg.clear()
+            config._cfg.update(original_cfg)
+
+    def test_save_config_preserves_owner_when_running_as_root(self):
+        """
+        在容器环境（root/UID 0）中运行时，若原配置文件属于宿主机非 root 用户，
+        保存配置应尝试保留原有 uid/gid，避免宿主机用户失去访问权限。
+        """
+        original_cfg = dict(config._cfg)
+        original_app = dict(config.app)
+        try:
+            with TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text("[app]\nvideo_source = \"pexels\"\n", encoding="utf-8")
+                config.app["chown_test"] = "ok"
+
+                fake_stat = os.stat_result((
+                    0o100600,  # st_mode
+                    12345,     # st_ino
+                    1,         # st_dev
+                    1,         # st_nlink
+                    1000,      # st_uid
+                    1000,      # st_gid
+                    100,       # st_size
+                    0, 0, 0,
+                ))
+
+                real_stat = config.os.stat
+                def fake_stat_func(path, *args, **kwargs):
+                    if str(path) == str(config_path):
+                        return fake_stat
+                    return real_stat(path, *args, **kwargs)
+
+                with (
+                    patch.object(config, "root_dir", temp_dir),
+                    patch.object(config, "config_file", str(config_path)),
+                    patch.object(config.os, "stat", side_effect=fake_stat_func),
+                    patch.object(config.os, "geteuid", return_value=0, create=True),
+                    patch.object(config.os, "chown", create=True) as chown_mock,
+                ):
+                    config.save_config()
+
+                chown_mock.assert_called_once()
+                assert chown_mock.call_args.args[1] == 1000
+                assert chown_mock.call_args.args[2] == 1000
         finally:
             config.app.clear()
             config.app.update(original_app)
