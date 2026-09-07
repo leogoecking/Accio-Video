@@ -327,6 +327,9 @@
     "Pollinations (Flux Free)": "Pollinations (Flux Miễn phí)",
     "Google Gemini Image": "Hình ảnh Google Gemini",
     "Enable AI Image Fallback (Ken Burns)": "Bật dự phòng hình ảnh AI (Ken Burns)",
-    "AI Image Fallback Help": "Tự động tạo hình ảnh AI với chuyển động điện ảnh Ken Burns khi không tìm thấy video có sẵn phù hợp."
+    "AI Image Fallback Help": "Tự động tạo hình ảnh AI với chuyển động điện ảnh Ken Burns khi không tìm thấy video có sẵn phù hợp.",
+    "Review Draft (Storyboard before final render)": "Xem lại bản nháp (Storyboard trước khi kết xuất)",
+    "Review Draft Help": "Tạm dừng sau khi tạo kịch bản, giọng đọc và tư liệu để bạn kiểm tra từng cảnh trước khi xuất video hoàn chỉnh.",
+    "Rendering Final Video": "Đang kết xuất video cuối cùng..."
   }
 }

@@ -327,6 +327,9 @@
     "Pollinations (Flux Free)": "Pollinations (Ücretsiz Flux)",
     "Google Gemini Image": "Google Gemini Görsel",
     "Enable AI Image Fallback (Ken Burns)": "Yapay Zeka Görsel Yedeklemeyi Etkinleştir",
-    "AI Image Fallback Help": "Eşleşen stok video bulunamadığında otomatik olarak sinematik Ken Burns hareketli yapay zeka görselleri oluşturur."
+    "AI Image Fallback Help": "Eşleşen stok video bulunamadığında otomatik olarak sinematik Ken Burns hareketli yapay zeka görselleri oluşturur.",
+    "Review Draft (Storyboard before final render)": "Taslağı İncele (Oluşturmadan önce Storyboard)",
+    "Review Draft Help": "Son render işleminden önce sahneleri inceleyebilmeniz için seslendirme ve materyallerden sonra duraklar.",
+    "Rendering Final Video": "Nihai video işleniyor..."
   }
 }

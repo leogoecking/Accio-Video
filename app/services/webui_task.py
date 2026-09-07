@@ -169,3 +169,85 @@ def submit_generation(
             f"failed to submit WebUI generation task, task_id={task_id}, error={exc}"
         )
         raise
+
+
+def _run_final_render(
+    task_id: str,
+    params: VideoParams,
+    capture_logs: bool,
+) -> dict:
+    """
+    Executes the final video render from an approved Storyboard draft.
+    """
+    log_handler_id = None
+    worker_thread_id = threading.get_ident()
+    try:
+        if capture_logs:
+            log_handler_id = logger.add(
+                lambda message: _append_task_log(task_id, str(message)),
+                level="DEBUG",
+                format=format_log_record,
+                colorize=False,
+                filter=lambda record: record["thread"].id == worker_thread_id,
+            )
+
+        with config.runtime_config_lock():
+            return tm.render_final_from_draft(
+                task_id=task_id,
+                params=params,
+            )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        failure = {
+            "task_id": task_id,
+            "state": const.TASK_STATE_FAILED,
+            "progress": 0,
+            "failed_stage": "webui_worker",
+            "error": error,
+        }
+        sm.state.update_task(
+            task_id,
+            state=failure["state"],
+            progress=failure["progress"],
+            failed_stage=failure["failed_stage"],
+            error=failure["error"],
+        )
+        logger.exception(
+            f"unexpected WebUI final render worker failure, "
+            f"task_id={task_id}, error={exc}"
+        )
+        return failure
+    finally:
+        if log_handler_id is not None:
+            try:
+                logger.remove(log_handler_id)
+            except ValueError:
+                pass
+
+
+def submit_draft_final_render(
+    task_id: str,
+    params: VideoParams | None = None,
+    capture_logs: bool = True,
+) -> None:
+    """
+    Submits an approved Storyboard draft to be rendered into final video in the background.
+    """
+    if params is None:
+        raw_params = (sm.state.get_task(task_id) or {}).get("params") or {}
+        task_params = VideoParams.model_validate(raw_params)
+    else:
+        task_params = params.model_copy(deep=True)
+
+    sm.state.update_task(
+        task_id,
+        state=const.TASK_STATE_PROCESSING,
+        progress=65,
+    )
+    _task_manager.add_task(
+        _run_final_render,
+        task_id=task_id,
+        params=task_params,
+        capture_logs=capture_logs,
+    )
+

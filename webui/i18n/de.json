@@ -327,6 +327,9 @@
     "Pollinations (Flux Free)": "Pollinations (Flux Kostenlos)",
     "Google Gemini Image": "Google Gemini Bild",
     "Enable AI Image Fallback (Ken Burns)": "KI-Bild Fallback aktivieren (Ken Burns)",
-    "AI Image Fallback Help": "Erzeugt automatisch KI-Bilder mit filmischer Ken-Burns-Kamerabewegung, wenn keine passenden Stock-Videos gefunden werden."
+    "AI Image Fallback Help": "Erzeugt automatisch KI-Bilder mit filmischer Ken-Burns-Kamerabewegung, wenn keine passenden Stock-Videos gefunden werden.",
+    "Review Draft (Storyboard before final render)": "Entwurf prüfen (Storyboard vor dem Rendern)",
+    "Review Draft Help": "Pausiert nach Generierung von Skript, Voiceover und Material zur Szenenprüfung vor dem finalen Rendern.",
+    "Rendering Final Video": "Finales Video wird gerendert..."
   }
 }

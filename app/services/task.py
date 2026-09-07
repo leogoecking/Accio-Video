@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import re
@@ -7,6 +8,7 @@ import time
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from functools import partial
 from os import path
+from typing import Any
 from uuid import uuid4
 
 from loguru import logger
@@ -1378,6 +1380,60 @@ def _run_pipeline(
         )
         return {"materials": downloaded_videos}
 
+    # If draft mode / storyboard is enabled, pause for review
+    if getattr(params, "draft_mode", False) or stop_at == "draft":
+        from webui.components.storyboard import (
+            create_storyboard_draft,
+            save_storyboard_draft,
+        )
+
+        task_dir = utils.task_dir(task_id)
+        lines = [
+            line.strip()
+            for line in re.split(r"[\n\r]+", video_script)
+            if line.strip()
+        ]
+        if not lines:
+            lines = [video_script]
+
+        sources = []
+        sources_file = os.path.join(task_dir, "material_sources.json")
+        if os.path.isfile(sources_file):
+            try:
+                with open(sources_file, "r", encoding="utf-8") as sf:
+                    sources = json.load(sf)
+            except Exception:
+                sources = []
+
+        draft = create_storyboard_draft(
+            task_id=task_id,
+            video_subject=params.video_subject or "Video",
+            script_lines=lines,
+            video_paths=downloaded_videos,
+            audio_duration=audio_duration,
+            material_sources=sources,
+        )
+        save_storyboard_draft(task_id, draft)
+
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_DRAFT_READY,
+            progress=60,
+            script=video_script,
+            terms=video_terms,
+            audio_file=audio_file,
+            audio_duration=audio_duration,
+            subtitle_path=subtitle_path,
+            materials=downloaded_videos,
+            params=params.model_dump(mode="json"),
+        )
+        logger.info(f"task {task_id} paused at draft review stage (storyboard ready)")
+        return {
+            "draft": draft.to_dict(),
+            "task_id": task_id,
+            "state": const.TASK_STATE_DRAFT_READY,
+        }
+
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=50)
 
     # 仅完整视频生成流程才需要处理视频拼接模式；
@@ -1462,6 +1518,101 @@ def _run_pipeline(
             kwargs["cross_post_owner"] = None
 
     return kwargs
+
+
+def render_final_from_draft(
+    task_id: str,
+    params: VideoParams | None = None,
+    draft: Any = None,
+) -> dict:
+    """
+    Renders the final video using the approved/modified Storyboard draft.
+    """
+    from webui.components.storyboard import (
+        load_storyboard_draft,
+        save_storyboard_draft,
+    )
+
+    current_task = sm.state.get_task(task_id) or {}
+    if not current_task:
+        return _mark_task_failed(task_id, "draft", "task not found")
+
+    if draft is None:
+        draft = load_storyboard_draft(task_id)
+
+    if not draft:
+        return _mark_task_failed(task_id, "draft", "storyboard draft not found")
+
+    if params is None:
+        raw_params = current_task.get("params") or {}
+        params = VideoParams.model_validate(raw_params)
+
+    sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=70)
+
+    # 1. Collect approved video materials in storyboard scene order
+    approved_videos = [
+        scene.material_path
+        for scene in draft.scenes
+        if scene.material_path and os.path.exists(scene.material_path)
+    ]
+    if not approved_videos:
+        approved_videos = current_task.get("materials", [])
+
+    if not approved_videos:
+        return _mark_task_failed(
+            task_id, "draft", "no valid scene materials found in draft"
+        )
+
+    audio_file = current_task.get("audio_file") or os.path.join(
+        utils.task_dir(task_id), "audio.mp3"
+    )
+    subtitle_path = current_task.get("subtitle_path") or os.path.join(
+        utils.task_dir(task_id), "subtitle.srt"
+    )
+    audio_duration = float(
+        current_task.get("audio_duration") or draft.total_duration or 0.0
+    )
+
+    # 2. Concat mode handling
+    if type(params.video_concat_mode) is str:
+        params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
+
+    # 3. Generate final videos
+    final_video_paths, combined_video_paths, generation_warnings = (
+        generate_final_videos(
+            task_id,
+            params,
+            approved_videos,
+            audio_file,
+            subtitle_path,
+            audio_duration,
+        )
+    )
+
+    if not final_video_paths:
+        return _mark_task_failed(task_id, "video", "failed to generate final video")
+
+    # Mark draft as completed
+    draft.status = "completed"
+    save_storyboard_draft(task_id, draft)
+
+    kwargs = {
+        "videos": final_video_paths,
+        "combined_videos": combined_video_paths,
+        "materials": approved_videos,
+        "warnings": generation_warnings or None,
+    }
+    sm.state.update_task(
+        task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
+    )
+    logger.success(
+        f"task {task_id} completed successfully via storyboard render: {len(final_video_paths)} videos"
+    )
+    return {
+        "videos": final_video_paths,
+        "task_id": task_id,
+        "state": const.TASK_STATE_COMPLETE,
+    }
 
 
 def start(

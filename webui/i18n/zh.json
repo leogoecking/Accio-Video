@@ -392,6 +392,9 @@
     "Pollinations (Flux Free)": "Pollinations (Flux 免费无限制)",
     "Google Gemini Image": "Google Gemini 图像生成",
     "Enable AI Image Fallback (Ken Burns)": "启用 AI 图像兜底 (Ken Burns 运镜)",
-    "AI Image Fallback Help": "当库存视频无匹配结果时，自动使用 AI 生成高清图像并转为电影级运镜视频片段。"
+    "AI Image Fallback Help": "当库存视频无匹配结果时，自动使用 AI 生成高清图像并转为电影级运镜视频片段。",
+    "Review Draft (Storyboard before final render)": "分镜草稿审查 (渲染前逐幕确认)",
+    "Review Draft Help": "生成文案、配音与素材后暂停，允许在最终合成前逐幕预览画面、微调字幕与替换素材。",
+    "Rendering Final Video": "正在渲染最终视频..."
   }
 }

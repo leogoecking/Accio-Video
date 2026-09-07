@@ -667,6 +667,7 @@ def _normalize_task_state(state):
         const.TASK_STATE_COMPLETE,
         const.TASK_STATE_FAILED,
         const.TASK_STATE_PROCESSING,
+        getattr(const, "TASK_STATE_DRAFT_READY", 2),
     ):
         return state
     try:
@@ -1768,6 +1769,30 @@ def _render_current_generation_task():
         return
 
     state = _normalize_task_state((task or {}).get("state"))
+    if state == getattr(const, "TASK_STATE_DRAFT_READY", 2):
+        def _on_approve_storyboard(draft):
+            try:
+                from webui.components.storyboard import save_storyboard_draft
+                save_storyboard_draft(task_id, draft)
+                st.toast(tr("Rendering Final Video"))
+                webui_task.submit_draft_final_render(task_id)
+                st.rerun(scope="app")
+            except Exception as exc:
+                st.error(f"Erro ao renderizar: {exc}")
+
+        def _on_discard_storyboard(tid):
+            _remove_active_generation_task(tid)
+            st.session_state["current_generation_task_id"] = ""
+            st.rerun(scope="app")
+
+        from webui.components import storyboard_view
+        storyboard_view.render_storyboard_panel(
+            task_id=task_id,
+            on_render_callback=_on_approve_storyboard,
+            on_discard_callback=_on_discard_storyboard,
+        )
+        return
+
     if state in {const.TASK_STATE_COMPLETE, const.TASK_STATE_FAILED}:
         _remove_active_generation_task(task_id)
         _render_generation_task_snapshot(task_id, task)
@@ -3723,6 +3748,12 @@ def _render_video_settings(panel, params):
                 "app",
                 "match_materials_to_script",
                 params.match_materials_to_script,
+            )
+            params.draft_mode = st.checkbox(
+                tr("Review Draft (Storyboard before final render)"),
+                help=tr("Review Draft Help"),
+                key="draft_mode_checkbox",
+                value=bool(st.session_state.get("draft_mode_checkbox", False)),
             )
             # 顺序匹配开启时，sequential 是派生出的强制值，不应覆盖用户在关闭
             # 该功能时选择的拼接偏好；关闭后仍能恢复此前的 random/sequential。
@@ -5866,6 +5897,9 @@ def _render_application():
     params = VideoParams(video_subject="")
     params.match_materials_to_script = bool(
         st.session_state.get("match_materials_to_script", False)
+    )
+    params.draft_mode = bool(
+        st.session_state.get("draft_mode_checkbox", False)
     )
     _render_script_settings(left_panel, params)
 

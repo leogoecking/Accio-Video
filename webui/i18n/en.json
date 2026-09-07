@@ -392,6 +392,9 @@
     "Pollinations (Flux Free)": "Pollinations (Flux Free)",
     "Google Gemini Image": "Google Gemini Image",
     "Enable AI Image Fallback (Ken Burns)": "Enable AI Image Fallback (Ken Burns)",
-    "AI Image Fallback Help": "Automatically generates AI images with cinematic Ken Burns motion when no matching stock videos are found."
+    "AI Image Fallback Help": "Automatically generates AI images with cinematic Ken Burns motion when no matching stock videos are found.",
+    "Review Draft (Storyboard before final render)": "Review Draft (Storyboard before final render)",
+    "Review Draft Help": "Pauses after generating script, voiceover, and footage so you can review scenes, tweak narration, and change media before final rendering.",
+    "Rendering Final Video": "Rendering final video..."
   }
 }

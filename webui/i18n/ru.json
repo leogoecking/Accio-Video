@@ -327,6 +327,9 @@
     "Pollinations (Flux Free)": "Pollinations (Бесплатный Flux)",
     "Google Gemini Image": "Изображение Google Gemini",
     "Enable AI Image Fallback (Ken Burns)": "Включить ИИ-изображения при отсутствии видео",
-    "AI Image Fallback Help": "Автоматически создает ИИ-изображения с кинематографичным эффектом Ken Burns, если подходящие стоковые видео не найдены."
+    "AI Image Fallback Help": "Автоматически создает ИИ-изображения с кинематографичным эффектом Ken Burns, если подходящие стоковые видео не найдены.",
+    "Review Draft (Storyboard before final render)": "Проверить раскадровку (перед финальным рендером)",
+    "Review Draft Help": "Приостанавливает процесс после генерации сценария, озвучки и видео для предпросмотра сцен перед рендером.",
+    "Rendering Final Video": "Рендеринг финального видео..."
   }
 }

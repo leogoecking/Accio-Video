@@ -327,6 +327,9 @@
     "Pollinations (Flux Free)": "Pollinations (Flux Gratis)",
     "Google Gemini Image": "Gambar Google Gemini",
     "Enable AI Image Fallback (Ken Burns)": "Aktifkan Fallback Gambar AI (Ken Burns)",
-    "AI Image Fallback Help": "Secara otomatis menghasilkan gambar AI dengan gerakan sinematik Ken Burns saat tidak ada video stok yang cocok."
+    "AI Image Fallback Help": "Secara otomatis menghasilkan gambar AI dengan gerakan sinematik Ken Burns saat tidak ada video stok yang cocok.",
+    "Review Draft (Storyboard before final render)": "Tinjau Draf (Storyboard sebelum render final)",
+    "Review Draft Help": "Jeda setelah pembuatan skrip, sulih suara, dan materi untuk meninjau adegan sebelum render akhir.",
+    "Rendering Final Video": "Merender video akhir..."
   }
 }

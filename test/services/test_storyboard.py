@@ -168,6 +168,106 @@ class TestStoryboardComponent(unittest.TestCase):
             self.assertEqual(res, out_thumb)
             self.assertTrue(os.path.exists(out_thumb))
 
+    def test_pipeline_draft_mode_pauses_at_draft_ready(self):
+        from app.models import const
+        from app.models.schema import VideoParams
+        from app.services import state as sm
+        from app.services import task as tm
+
+        task_id = "test_draft_pause"
+        params = VideoParams(
+            video_subject="Ocean Life",
+            draft_mode=True,
+        )
+
+        with (
+            patch("app.utils.utils.check_ffmpeg_ready", return_value=True),
+            patch("app.services.task.generate_script", return_value="Ocean is deep.\nWhales are big."),
+            patch("app.services.task.generate_terms", return_value=["ocean", "whales"]),
+            patch("app.services.task.generate_audio", return_value=("/tmp/audio.mp3", 8.0, {})),
+            patch("app.services.task.generate_subtitle", return_value="/tmp/sub.srt"),
+            patch("app.services.task.get_video_materials", return_value=["/tmp/v1.mp4", "/tmp/v2.mp4"]),
+            patch("app.utils.utils.task_dir", return_value=self.temp_dir.name),
+            patch("webui.components.storyboard.generate_scene_thumbnail", return_value="/tmp/thumb.jpg"),
+            patch("app.services.task.generate_final_videos") as mock_final,
+        ):
+            res = tm._run_pipeline(task_id, params)
+
+        self.assertEqual(res["state"], const.TASK_STATE_DRAFT_READY)
+        self.assertIn("draft", res)
+        # Ensure final rendering was not called in draft mode
+        mock_final.assert_not_called()
+
+        task = sm.state.get_task(task_id)
+        self.assertEqual(task.get("state"), const.TASK_STATE_DRAFT_READY)
+        self.assertEqual(task.get("progress"), 60)
+
+    def test_render_final_from_draft_completes_task(self):
+        from app.models import const
+        from app.models.schema import VideoParams
+        from app.services import state as sm
+        from app.services import task as tm
+
+        task_id = "test_draft_resume"
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_DRAFT_READY,
+            progress=60,
+            materials=["/tmp/old.mp4"],
+            audio_file="/tmp/audio.mp3",
+            subtitle_path="/tmp/sub.srt",
+            audio_duration=6.0,
+        )
+
+        draft = StoryboardDraft(
+            task_id=task_id,
+            video_subject="Ocean Life",
+            total_duration=6.0,
+            scenes=[
+                StoryboardScene(scene_index=1, text="Ocean is deep", material_path="/tmp/new_scene1.mp4"),
+            ],
+        )
+
+        with (
+            patch("os.path.exists", return_value=True),
+            patch("app.utils.utils.task_dir", return_value=self.temp_dir.name),
+            patch(
+                "app.services.task.generate_final_videos",
+                return_value=(["/tmp/final-1.mp4"], ["/tmp/combined-1.mp4"], []),
+            ) as mock_final,
+        ):
+            params = VideoParams(video_subject="Ocean Life")
+            res = tm.render_final_from_draft(task_id, params, draft=draft)
+
+        self.assertEqual(res["state"], const.TASK_STATE_COMPLETE)
+        self.assertEqual(res["videos"], ["/tmp/final-1.mp4"])
+        mock_final.assert_called_once()
+        task = sm.state.get_task(task_id)
+        self.assertEqual(task.get("state"), const.TASK_STATE_COMPLETE)
+        self.assertEqual(task.get("progress"), 100)
+
+    def test_webui_task_submit_draft_final_render(self):
+        from app.models import const
+        from app.models.schema import VideoParams
+        from app.services import state as sm
+        from app.services import webui_task
+
+        task_id = "test_webui_submit_draft"
+        sm.state.update_task(
+            task_id,
+            state=const.TASK_STATE_DRAFT_READY,
+            progress=60,
+        )
+
+        params = VideoParams(video_subject="Space Exploration")
+        with patch.object(webui_task._task_manager, "add_task") as mock_add_task:
+            webui_task.submit_draft_final_render(task_id, params=params)
+
+        mock_add_task.assert_called_once()
+        task = sm.state.get_task(task_id)
+        self.assertEqual(task.get("state"), const.TASK_STATE_PROCESSING)
+        self.assertEqual(task.get("progress"), 65)
+
 
 if __name__ == "__main__":
     unittest.main()
