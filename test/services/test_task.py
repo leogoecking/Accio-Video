@@ -1498,7 +1498,6 @@ class TestTaskService(unittest.TestCase):
     def test_start_returns_cross_post_scheduling_failure(self):
         """同步调度失败必须同时体现在任务状态和 start() 返回快照中。"""
         params = VideoParams(video_subject="Coffee")
-        service = tm.upload_post.upload_post_service
         state = MemoryState()
 
         with (
@@ -1517,10 +1516,21 @@ class TestTaskService(unittest.TestCase):
                 "generate_final_videos",
                 return_value=(["final.mp4"], ["combined.mp4"], []),
             ),
-            patch.object(service, "is_configured", return_value=True),
-            patch.object(service, "auto_upload", True),
-            patch.object(service, "platforms", ["tiktok"]),
-            patch.object(service, "youtube_privacy_status", "private"),
+            patch.object(
+                tm.social_publishing,
+                "publishing_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                tm.social_publishing,
+                "configured_platforms",
+                return_value=["tiktok"],
+            ),
+            patch.object(
+                tm.social_publishing,
+                "youtube_privacy_status",
+                return_value="private",
+            ),
             patch.object(tm.sm, "state", state),
             patch.object(tm._cross_post_slots, "acquire", return_value=False),
             patch.object(tm._cross_post_executor, "submit") as submit,
