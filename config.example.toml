@@ -360,6 +360,18 @@ instagram_direct_api_version = "v26.0"
 instagram_direct_share_to_feed = true
 instagram_direct_token_file = "instagram-token.json"
 
+# Direct TikTok posting through the official Content Posting API. The initial
+# integration runs in private test mode: the creator must review and confirm each
+# post, and visibility is restricted to SELF_ONLY. Register the exact HTTPS
+# redirect URI in TikTok Login Kit for Desktop and request user.info.basic plus
+# video.publish. OAuth tokens are stored under storage/credentials.
+tiktok_direct_enabled = false
+tiktok_direct_client_key = ""
+tiktok_direct_client_secret = ""
+tiktok_direct_redirect_uri = "https://localhost:8501/"
+tiktok_direct_test_mode = true
+tiktok_direct_token_file = "tiktok-token.json"
+
 # =============================================================================
 # Whisper Subtitles / Whisper 字幕
 # =============================================================================

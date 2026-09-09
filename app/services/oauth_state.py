@@ -35,15 +35,31 @@ class OAuthStateStore:
         credentials_dir = Path(utils.storage_dir("credentials", create=True)).resolve()
         return credentials_dir / f"{self.provider}-oauth-state.json"
 
-    def issue(self) -> str:
+    def issue(self, extra: dict | None = None) -> str:
         state = secrets.token_urlsafe(32)
-        self._save({"state": state, "created_at": time.time()})
+        payload = dict(extra or {})
+        payload.update({"state": state, "created_at": time.time()})
+        self._save(payload)
         return state
 
     def consume(self, candidate: str) -> bool:
+        return bool(self.consume_payload(candidate))
+
+    def peek(self, candidate: str) -> dict:
+        """Return a valid pending payload without consuming it."""
+        return self._validated_payload(candidate)
+
+    def consume_payload(self, candidate: str) -> dict:
+        """Consume and return a valid pending payload."""
+        payload = self._validated_payload(candidate)
+        if payload:
+            self.clear()
+        return payload
+
+    def _validated_payload(self, candidate: str) -> dict:
         value = str(candidate or "").strip()
         if not value:
-            return False
+            return {}
 
         payload = self._load()
         expected = str(payload.get("state") or "")
@@ -53,15 +69,13 @@ class OAuthStateStore:
             created_at = 0
 
         if not expected or created_at <= 0:
-            return False
+            return {}
         if time.time() - created_at > self.MAX_AGE_SECONDS:
             self.clear()
-            return False
+            return {}
         if not hmac.compare_digest(value, expected):
-            return False
-
-        self.clear()
-        return True
+            return {}
+        return payload
 
     def clear(self) -> None:
         try:

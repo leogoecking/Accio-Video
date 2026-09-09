@@ -44,6 +44,19 @@ class TestOAuthStateStore(unittest.TestCase):
             self.assertFalse(store.consume("different-state"))
             self.assertTrue(store.consume(state))
 
+    def test_extra_payload_can_be_peeked_and_consumed_once(self):
+        store = OAuthStateStore("tiktok")
+
+        with self._path_patch():
+            state = store.issue({"code_verifier": "pkce-verifier"})
+
+            self.assertEqual(store.peek(state)["code_verifier"], "pkce-verifier")
+            self.assertTrue(self.state_path.exists())
+            self.assertEqual(
+                store.consume_payload(state)["code_verifier"], "pkce-verifier"
+            )
+            self.assertEqual(store.consume_payload(state), {})
+
     def test_expired_state_is_rejected_and_removed(self):
         store = OAuthStateStore("instagram")
         self.state_path.write_text(

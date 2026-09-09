@@ -48,6 +48,7 @@ from app.services import (
     instagram_publisher,
     llm,
     loomloom,
+    tiktok_publisher,
     video,
     voice,
     webui_task,
@@ -196,6 +197,8 @@ PUBLISHING_CREDENTIAL_COMPANION_KEYS = {
         "youtube_direct_redirect_uri",
         "instagram_direct_app_id",
         "instagram_direct_redirect_uri",
+        "tiktok_direct_client_key",
+        "tiktok_direct_redirect_uri",
     ),
 }
 # 同一个密钥在不同面板可能使用各自的控件 key：音频面板直接编辑 Gemini 和
@@ -1696,6 +1699,297 @@ def _render_generation_logs(task_id):
     st.code("\n".join(log_records))
 
 
+def _tiktok_result_for_video(task, video_path):
+    results = task.get("tiktok_direct_results") or []
+    for result in results:
+        if isinstance(result, Mapping) and result.get("video_path") == video_path:
+            return dict(result)
+    return {}
+
+
+def _save_tiktok_result(task_id, task, video_path, result):
+    results = [
+        dict(item)
+        for item in (task.get("tiktok_direct_results") or [])
+        if isinstance(item, Mapping) and item.get("video_path") != video_path
+    ]
+    results.append({"video_path": video_path, **dict(result)})
+    if not sm.state.patch_task(task_id, tiktok_direct_results=results):
+        raise RuntimeError("The completed video task is no longer available")
+    task["tiktok_direct_results"] = results
+
+
+def _render_tiktok_publish_panel(task_id, task, video_files):
+    """Require a per-video review and explicit consent before TikTok upload."""
+    service = tiktok_publisher.tiktok_publisher
+    if not service.is_configured():
+        return
+
+    st.divider()
+    st.subheader(_publishing_text("Publish to TikTok", "Publicar no TikTok"))
+    st.caption(
+        _publishing_text(
+            "The initial integration uses TikTok's private test mode. Each video must be reviewed and confirmed before upload.",
+            "A integração inicial usa o modo privado de teste do TikTok. Cada vídeo precisa ser revisado e confirmado antes do envio.",
+        )
+    )
+
+    for index, video_path in enumerate(video_files):
+        panel_key = f"tiktok_{task_id}_{index}"
+        creator_key = f"{panel_key}_creator_info"
+        existing_result = _tiktok_result_for_video(task, video_path)
+        label = _publishing_text(
+            f"TikTok — video {index + 1}",
+            f"TikTok — vídeo {index + 1}",
+        )
+        with st.expander(label, expanded=not bool(existing_result)):
+            if existing_result:
+                status = str(existing_result.get("processing_status") or "")
+                if existing_result.get("success") and status == "PUBLISH_COMPLETE":
+                    st.success(
+                        _publishing_text(
+                            "TikTok confirmed the private post.",
+                            "O TikTok confirmou a postagem privada.",
+                        )
+                    )
+                elif existing_result.get("success"):
+                    st.info(
+                        _publishing_text(
+                            f"TikTok is processing this post ({status or 'PROCESSING_UPLOAD'}).",
+                            f"O TikTok está processando esta postagem ({status or 'PROCESSING_UPLOAD'}).",
+                        )
+                    )
+                    if st.button(
+                        _publishing_text("Refresh TikTok status", "Atualizar status do TikTok"),
+                        key=f"{panel_key}_refresh_status",
+                        use_container_width=True,
+                    ):
+                        try:
+                            current = service.get_post_status(
+                                existing_result.get("publish_id", "")
+                            )
+                            processing_status = str(
+                                current.get("status") or "PROCESSING_UPLOAD"
+                            )
+                            updated = {
+                                **existing_result,
+                                "success": processing_status != "FAILED",
+                                "status": (
+                                    "published"
+                                    if processing_status == "PUBLISH_COMPLETE"
+                                    else (
+                                        "failed"
+                                        if processing_status == "FAILED"
+                                        else "processing"
+                                    )
+                                ),
+                                "processing_status": processing_status,
+                            }
+                            if processing_status == "FAILED":
+                                updated["error"] = str(
+                                    current.get("fail_reason") or "TikTok post failed"
+                                )
+                            _save_tiktok_result(
+                                task_id, task, video_path, updated
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                f"failed to refresh TikTok post status: task_id={task_id}, error={exc}"
+                            )
+                            st.error(str(exc))
+                        else:
+                            st.rerun(scope="app")
+                else:
+                    st.error(
+                        _publishing_text(
+                            f"TikTok publishing failed: {existing_result.get('error') or 'unknown error'}",
+                            f"A publicação no TikTok falhou: {existing_result.get('error') or 'erro desconhecido'}",
+                        )
+                    )
+
+            if st.button(
+                _publishing_text(
+                    "Prepare TikTok post",
+                    "Preparar postagem no TikTok",
+                ),
+                key=f"{panel_key}_prepare",
+                use_container_width=True,
+            ):
+                try:
+                    st.session_state[creator_key] = service.get_creator_info()
+                except Exception as exc:
+                    logger.error(
+                        f"failed to load TikTok creator information: task_id={task_id}, error={exc}"
+                    )
+                    st.error(str(exc))
+
+            creator = st.session_state.get(creator_key)
+            if not isinstance(creator, Mapping):
+                continue
+
+            nickname = str(creator.get("creator_nickname") or "").strip()
+            username = str(creator.get("creator_username") or "").strip()
+            account_name = nickname or (f"@{username}" if username else "TikTok")
+            st.caption(
+                _publishing_text(
+                    f"Posting as {account_name}. The video is marked as AI-generated.",
+                    f"Publicando como {account_name}. O vídeo será marcado como gerado por IA.",
+                )
+            )
+
+            title_default = str(
+                task.get("video_subject") or task.get("script") or ""
+            ).strip()
+            title = st.text_area(
+                _publishing_text("Caption", "Legenda"),
+                value=title_default,
+                max_chars=2200,
+                key=f"{panel_key}_title",
+            )
+
+            privacy_options = [
+                str(value)
+                for value in creator.get("privacy_level_options", [])
+                if value
+            ]
+            if service.test_mode:
+                privacy_options = [
+                    value
+                    for value in privacy_options
+                    if value.upper() == service.TEST_PRIVACY_LEVEL
+                ]
+            if not privacy_options:
+                st.error(
+                    _publishing_text(
+                        "This account does not offer SELF_ONLY, which is required in private test mode.",
+                        "Esta conta não oferece SELF_ONLY, exigido no modo privado de teste.",
+                    )
+                )
+                continue
+
+            privacy = st.selectbox(
+                _publishing_text("Who can view", "Quem pode assistir"),
+                options=privacy_options,
+                index=None,
+                placeholder=_publishing_text(
+                    "Choose visibility",
+                    "Escolha a visibilidade",
+                ),
+                format_func=lambda value: {
+                    "SELF_ONLY": _publishing_text("Only me", "Somente eu"),
+                    "MUTUAL_FOLLOW_FRIENDS": _publishing_text("Friends", "Amigos"),
+                    "FOLLOWER_OF_CREATOR": _publishing_text("Followers", "Seguidores"),
+                    "PUBLIC_TO_EVERYONE": _publishing_text("Everyone", "Todos"),
+                }.get(value, value),
+                key=f"{panel_key}_privacy",
+            )
+
+            permission_columns = st.columns(3)
+            with permission_columns[0]:
+                allow_comment = st.checkbox(
+                    _publishing_text("Allow comments", "Permitir comentários"),
+                    value=False,
+                    disabled=bool(creator.get("comment_disabled", False)),
+                    key=f"{panel_key}_comments",
+                )
+            with permission_columns[1]:
+                allow_duet = st.checkbox(
+                    _publishing_text("Allow Duet", "Permitir Dueto"),
+                    value=False,
+                    disabled=bool(creator.get("duet_disabled", False)),
+                    key=f"{panel_key}_duet",
+                )
+            with permission_columns[2]:
+                allow_stitch = st.checkbox(
+                    _publishing_text("Allow Stitch", "Permitir Costura"),
+                    value=False,
+                    disabled=bool(creator.get("stitch_disabled", False)),
+                    key=f"{panel_key}_stitch",
+                )
+
+            commercial = st.checkbox(
+                _publishing_text(
+                    "This video promotes a brand, product, or service",
+                    "Este vídeo promove uma marca, produto ou serviço",
+                ),
+                value=False,
+                key=f"{panel_key}_commercial",
+            )
+            brand_organic = False
+            brand_content = False
+            if commercial:
+                brand_organic = st.checkbox(
+                    _publishing_text("My own brand", "Minha própria marca"),
+                    value=False,
+                    key=f"{panel_key}_own_brand",
+                )
+                brand_content = st.checkbox(
+                    _publishing_text("Third-party brand", "Marca de terceiros"),
+                    value=False,
+                    disabled=privacy == service.TEST_PRIVACY_LEVEL,
+                    key=f"{panel_key}_branded_content",
+                )
+
+            music_consent = st.checkbox(
+                _publishing_text(
+                    "I confirm that I agree to TikTok's Music Usage Confirmation",
+                    "Confirmo que concordo com a Confirmação de Uso de Música do TikTok",
+                ),
+                value=False,
+                key=f"{panel_key}_music_consent",
+            )
+            st.caption(
+                _publishing_text(
+                    "Do not upload videos with promotional watermarks or branding from another platform.",
+                    "Não envie vídeos com marca d'água promocional ou identificação de outra plataforma.",
+                )
+            )
+
+            commercial_invalid = commercial and not (brand_organic or brand_content)
+            if commercial_invalid:
+                st.warning(
+                    _publishing_text(
+                        "Select whose brand is promoted.",
+                        "Selecione qual marca está sendo promovida.",
+                    )
+                )
+            if st.button(
+                _publishing_text(
+                    "Confirm and publish privately",
+                    "Confirmar e publicar como privado",
+                ),
+                key=f"{panel_key}_publish",
+                type="primary",
+                disabled=not privacy or not music_consent or commercial_invalid,
+                use_container_width=True,
+            ):
+                with st.spinner(
+                    _publishing_text(
+                        "Uploading to TikTok...",
+                        "Enviando para o TikTok...",
+                    )
+                ):
+                    result = service.publish_video(
+                        video_path,
+                        title=title,
+                        privacy_level=privacy,
+                        allow_comment=allow_comment,
+                        allow_duet=allow_duet,
+                        allow_stitch=allow_stitch,
+                        brand_content=brand_content,
+                        brand_organic=brand_organic,
+                    )
+                try:
+                    _save_tiktok_result(task_id, task, video_path, result)
+                except Exception as exc:
+                    logger.error(
+                        f"failed to save TikTok result: task_id={task_id}, error={exc}"
+                    )
+                    st.error(str(exc))
+                else:
+                    st.rerun(scope="app")
+
+
 def _render_generation_task_snapshot(task_id, task):
     """根据状态存储中的快照渲染进度、失败原因或最终成片。"""
     if not task:
@@ -1789,6 +2083,7 @@ def _render_generation_task_snapshot(task_id, task):
             f"video_files={video_files}, error={exc}"
         )
 
+    _render_tiktok_publish_panel(task_id, task, video_files)
     _render_generation_logs(task_id)
     if st.session_state.get("handled_generation_task_id") != task_id:
         # Fragment 可能重复渲染同一个完成任务。无论是否开启自动打开目录，
@@ -2748,6 +3043,7 @@ def _handle_social_oauth_callback() -> None:
     providers = (
         ("youtube", youtube_publisher.youtube_publisher),
         ("instagram", instagram_publisher.instagram_publisher),
+        ("tiktok", tiktok_publisher.tiktok_publisher),
     )
     matched_provider = ""
     matched_service = None
@@ -3048,6 +3344,114 @@ def _render_social_publishing_settings(panel):
                 _publishing_text(
                     "Enter the Instagram App ID and App Secret to connect Instagram.",
                     "Informe o Instagram App ID e o Instagram App Secret para conectar o Instagram.",
+                )
+            )
+
+        st.divider()
+        st.subheader("TikTok")
+        tiktok_service = tiktok_publisher.tiktok_publisher
+        tiktok_enabled = st.checkbox(
+            _publishing_text(
+                "Use direct TikTok API",
+                "Usar API direta do TikTok",
+            ),
+            value=bool(config.app.get("tiktok_direct_enabled", False)),
+            key="tiktok_direct_enabled_checkbox",
+        )
+        _set_runtime_config("app", "tiktok_direct_enabled", tiktok_enabled)
+        tiktok_client_key = st.text_input(
+            "TikTok Client Key",
+            value=config.app.get("tiktok_direct_client_key", ""),
+            key="tiktok_direct_client_key_input",
+        ).strip()
+        tiktok_client_secret = st.text_input(
+            "TikTok Client Secret",
+            value=config.app.get("tiktok_direct_client_secret", ""),
+            type="password",
+            key="tiktok_direct_client_secret_input",
+        ).strip()
+        tiktok_redirect_uri = st.text_input(
+            "TikTok OAuth Redirect URI",
+            value=config.app.get(
+                "tiktok_direct_redirect_uri", "https://localhost:8501/"
+            ),
+            key="tiktok_direct_redirect_uri_input",
+            help=_publishing_text(
+                "Register this exact HTTPS URI in TikTok Login Kit for Desktop.",
+                "Cadastre exatamente este endereço HTTPS no Login Kit for Desktop do TikTok.",
+            ),
+        ).strip()
+        _set_runtime_config("app", "tiktok_direct_client_key", tiktok_client_key)
+        _set_runtime_config(
+            "app", "tiktok_direct_client_secret", tiktok_client_secret
+        )
+        _set_runtime_config(
+            "app", "tiktok_direct_redirect_uri", tiktok_redirect_uri
+        )
+        _set_runtime_config("app", "tiktok_direct_test_mode", True)
+
+        st.caption(
+            _publishing_text(
+                "Initial private test mode: posts use SELF_ONLY and require confirmation after the video preview. Request the user.info.basic and video.publish scopes in TikTok Developer Portal.",
+                "Modo privado inicial: as postagens usam SELF_ONLY e exigem confirmação após a prévia do vídeo. Solicite os escopos user.info.basic e video.publish no TikTok Developer Portal.",
+            )
+        )
+
+        if st.session_state.pop("tiktok_oauth_message", "") == "connected":
+            st.success(
+                _publishing_text(
+                    "TikTok account connected.",
+                    "Conta do TikTok conectada.",
+                )
+            )
+
+        tiktok_oauth_error = st.session_state.pop("tiktok_oauth_error", "")
+        if tiktok_oauth_error:
+            st.error(
+                _publishing_text(
+                    f"TikTok authorization failed: {tiktok_oauth_error}",
+                    f"A autorização do TikTok falhou: {tiktok_oauth_error}",
+                )
+            )
+
+        if tiktok_service.is_authorized():
+            account = tiktok_service.account_summary()
+            open_id = account.get("open_id") or "TikTok"
+            st.success(
+                _publishing_text(
+                    f"Direct TikTok publishing is authorized: {open_id}",
+                    f"A publicação direta no TikTok está autorizada: {open_id}",
+                )
+            )
+            if st.button(
+                _publishing_text("Disconnect TikTok", "Desconectar TikTok"),
+                key="disconnect_tiktok_button",
+                use_container_width=True,
+            ):
+                try:
+                    tiktok_service.disconnect()
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    st.rerun(scope="app")
+        elif tiktok_client_key and tiktok_client_secret and tiktok_redirect_uri:
+            oauth_state = tiktok_service.begin_authorization()
+            try:
+                authorization_url = tiktok_service.build_authorization_url(oauth_state)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.link_button(
+                    _publishing_text("Connect TikTok", "Conectar TikTok"),
+                    authorization_url,
+                    use_container_width=True,
+                    type="primary",
+                )
+        else:
+            st.info(
+                _publishing_text(
+                    "Enter the TikTok Client Key and Client Secret to connect TikTok.",
+                    "Informe o TikTok Client Key e o Client Secret para conectar o TikTok.",
                 )
             )
 

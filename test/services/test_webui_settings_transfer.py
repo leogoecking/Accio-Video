@@ -263,6 +263,8 @@ def test_key_backup_companion_keys_stay_in_sync_with_the_provider_registry():
         "youtube_direct_redirect_uri",
         "instagram_direct_app_id",
         "instagram_direct_redirect_uri",
+        "tiktok_direct_client_key",
+        "tiktok_direct_redirect_uri",
     }
 
 

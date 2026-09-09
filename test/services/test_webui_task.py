@@ -208,6 +208,7 @@ def test_completed_task_renders_subject_named_video_download(
         "st": fake_st,
         "tr": lambda key: key,
         "_render_generation_logs": lambda _task_id: None,
+        "_render_tiktok_publish_panel": lambda _task_id, _task, _videos: None,
     }
     module = ast.fix_missing_locations(ast.Module(body=selected_nodes, type_ignores=[]))
     exec(compile(module, str(WEBUI_MAIN), "exec"), namespace)
