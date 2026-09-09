@@ -29,7 +29,7 @@ from app.services import (
     video,
     voice,
 )
-from app.services import upload_post
+from app.services import social_publishing, upload_post  # noqa: F401
 from app.services import state as sm
 from app.utils import file_security, utils
 
@@ -60,11 +60,12 @@ _LOOMLOOM_STATE_RETRY_DELAY_SECONDS = 0.1
 _INTERRUPTED_CROSS_POST_ERROR = (
     "cross-posting was interrupted before the process completed"
 )
-# Map upload-post platform ids to the social platform names llm.py accepts.
+# Map publishing platform ids to the social platform names llm.py accepts.
 _CROSS_POST_SOCIAL_PLATFORMS = {
     "tiktok": "tiktok",
     "instagram": "instagram_reels",
     "facebook": "facebook_reels",
+    "youtube": "youtube_shorts",
 }
 # 视频配乐服务只需实现 ``is_enabled`` 和 ``generate_bgm``。供应商差异集中在
 # 文件扩展名、领域异常和 WebUI 警告代码；任务编排、0 音量短路及失败降级
@@ -1049,49 +1050,47 @@ def _run_cross_post(
         logger.info(
             f"cross-post started, task_id: {task_id}, platforms: {', '.join(platforms)}"
         )
-        youtube_extra = None
-        post_title = video_subject or "Check out this video! #shorts #viral"
-        if platforms:
-            has_youtube = any(platform.startswith("youtube") for platform in platforms)
-            social_platform = "youtube_shorts"
-            if not has_youtube:
-                first = (platforms[0] or "").strip().lower()
-                # llm.py resolves unknown ids to its default platform.
-                social_platform = _CROSS_POST_SOCIAL_PLATFORMS.get(first, first)
-            metadata = llm.generate_social_metadata(
+        metadata_by_platform = {}
+        for platform in platforms:
+            normalized_platform = (platform or "").strip().lower()
+            social_platform = _CROSS_POST_SOCIAL_PLATFORMS.get(
+                normalized_platform,
+                normalized_platform,
+            )
+            metadata_by_platform[normalized_platform] = llm.generate_social_metadata(
                 video_subject=video_subject,
                 video_script=video_script,
                 language=video_language or "",
                 platform=social_platform,
             )
-            if has_youtube:
-                youtube_extra = {
-                    "youtube_title": metadata.get("title", video_subject),
-                    "youtube_description": metadata.get("caption", ""),
-                    "tags": metadata.get("hashtags", []),
-                    "privacyStatus": youtube_privacy_status,
-                    "containsSyntheticMedia": True,
-                }
-            post_title = (
-                metadata.get("caption")
-                or metadata.get("title")
-                or video_subject
-                or "Check out this video! #shorts #viral"
-            )
 
-        for video_path in video_paths:
-            result = upload_post.cross_post_video(
-                video_path=video_path,
-                title=post_title,
-                platforms=list(platforms),
-                youtube_extra=youtube_extra,
-            )
-            if not isinstance(result, dict):
-                result = {
-                    "success": False,
-                    "error": "Upload-Post returned an invalid response",
+        for video_index, video_path in enumerate(video_paths, start=1):
+            for platform in platforms:
+                normalized_platform = (platform or "").strip().lower()
+                metadata = metadata_by_platform.get(normalized_platform) or {
+                    "title": video_subject,
+                    "caption": video_subject,
+                    "hashtags": [],
                 }
-            results.append(result)
+                result = social_publishing.publish_video(
+                    platform=normalized_platform,
+                    video_path=video_path,
+                    metadata=metadata,
+                    youtube_privacy_status=youtube_privacy_status,
+                )
+                if not isinstance(result, dict):
+                    result = {
+                        "success": False,
+                        "platform": normalized_platform,
+                        "provider": social_publishing.provider_for(
+                            normalized_platform
+                        ),
+                        "status": "failed",
+                        "error": "Publishing provider returned an invalid response",
+                    }
+                result.setdefault("platform", normalized_platform)
+                result.setdefault("video_index", video_index)
+                results.append(result)
 
         failures = [result for result in results if not result.get("success")]
         if failures:
@@ -1501,13 +1500,8 @@ def _run_pipeline(
 
     # 7. 先完成视频生成任务，再按需提交跨平台发布。第三方上传可能耗时
     # 数分钟，不应阻塞视频结果返回，也不能反向影响已经生成的成片。
-    cross_post_enabled = (
-        upload_post.upload_post_service.is_configured()
-        and upload_post.upload_post_service.auto_upload
-    )
-    platforms = (
-        list(upload_post.upload_post_service.platforms) if cross_post_enabled else []
-    )
+    cross_post_enabled = social_publishing.publishing_enabled()
+    platforms = social_publishing.configured_platforms() if cross_post_enabled else []
     should_cross_post = cross_post_enabled and bool(platforms)
     if cross_post_enabled and not platforms:
         logger.warning(
@@ -1541,9 +1535,7 @@ def _run_pipeline(
             params=params,
             video_script=video_script,
             platforms=platforms,
-            youtube_privacy_status=(
-                upload_post.upload_post_service.youtube_privacy_status
-            ),
+            youtube_privacy_status=social_publishing.youtube_privacy_status(),
         )
         # 队列满或线程池关闭属于同步可知的调度失败。任务状态已经由调度函数
         # 更新，这里同步修正返回快照，避免调用方收到与后续查询不一致的 pending。

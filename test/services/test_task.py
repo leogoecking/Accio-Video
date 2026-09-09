@@ -1241,7 +1241,6 @@ class TestTaskService(unittest.TestCase):
             "caption": "A better morning.",
             "hashtags": ["coffee", "shorts"],
         }
-        service = tm.upload_post.upload_post_service
         state = MemoryState()
 
         def run_immediately(function, *args):
@@ -1278,23 +1277,45 @@ class TestTaskService(unittest.TestCase):
                     [],
                 ),
             ),
-            patch.object(service, "is_configured", return_value=True),
-            patch.object(service, "auto_upload", True),
-            patch.object(service, "platforms", ["youtube"]),
-            patch.object(service, "youtube_privacy_status", "unlisted"),
+            patch.object(
+                tm.social_publishing,
+                "publishing_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                tm.social_publishing,
+                "configured_platforms",
+                return_value=["youtube"],
+            ),
+            patch.object(
+                tm.social_publishing,
+                "youtube_privacy_status",
+                return_value="unlisted",
+            ),
             patch.object(
                 tm.llm,
                 "generate_social_metadata",
                 return_value=metadata,
             ) as generate_metadata,
             patch.object(
-                tm.upload_post,
-                "cross_post_video",
+                tm.social_publishing,
+                "publish_video",
                 side_effect=[
-                    {"success": True},
-                    {"success": False, "error": "upload failed"},
+                    {
+                        "success": True,
+                        "platform": "youtube",
+                        "provider": "upload_post",
+                        "status": "accepted",
+                    },
+                    {
+                        "success": False,
+                        "error": "upload failed",
+                        "platform": "youtube",
+                        "provider": "upload_post",
+                        "status": "failed",
+                    },
                 ],
-            ) as cross_post,
+            ) as publish_video,
             patch.object(tm.sm, "state", state),
             patch.object(
                 tm._cross_post_executor,
@@ -1310,17 +1331,11 @@ class TestTaskService(unittest.TestCase):
             language="en",
             platform="youtube_shorts",
         )
-        expected_extra = {
-            "youtube_title": "Morning Coffee",
-            "youtube_description": "A better morning.",
-            "tags": ["coffee", "shorts"],
-            "privacyStatus": "unlisted",
-            "containsSyntheticMedia": True,
-        }
-        self.assertEqual(cross_post.call_count, 2)
-        for call in cross_post.call_args_list:
-            self.assertEqual(call.kwargs["youtube_extra"], expected_extra)
-            self.assertEqual(call.kwargs["platforms"], ["youtube"])
+        self.assertEqual(publish_video.call_count, 2)
+        for call in publish_video.call_args_list:
+            self.assertEqual(call.kwargs["platform"], "youtube")
+            self.assertEqual(call.kwargs["metadata"], metadata)
+            self.assertEqual(call.kwargs["youtube_privacy_status"], "unlisted")
 
         # start() 返回的是视频完成时的稳定快照；后台发布结果通过任务查询获取。
         self.assertEqual(result["cross_post_state"], tm.const.CROSS_POST_STATE_PENDING)
@@ -1333,8 +1348,21 @@ class TestTaskService(unittest.TestCase):
         self.assertEqual(
             published_task["cross_post_results"],
             [
-                {"success": True},
-                {"success": False, "error": "upload failed"},
+                {
+                    "success": True,
+                    "platform": "youtube",
+                    "provider": "upload_post",
+                    "status": "accepted",
+                    "video_index": 1,
+                },
+                {
+                    "success": False,
+                    "error": "upload failed",
+                    "platform": "youtube",
+                    "provider": "upload_post",
+                    "status": "failed",
+                    "video_index": 2,
+                },
             ],
         )
         self.assertEqual(published_task["cross_post_error"], "upload failed")
@@ -1342,7 +1370,6 @@ class TestTaskService(unittest.TestCase):
     def test_start_returns_before_cross_post_worker_runs(self):
         """视频任务完成时只提交发布工作，不能在生成线程中同步上传。"""
         params = VideoParams(video_subject="Coffee")
-        service = tm.upload_post.upload_post_service
         state = MemoryState()
         submitted = []
 
@@ -1366,11 +1393,22 @@ class TestTaskService(unittest.TestCase):
                 "generate_final_videos",
                 return_value=(["final.mp4"], ["combined.mp4"], []),
             ),
-            patch.object(service, "is_configured", return_value=True),
-            patch.object(service, "auto_upload", True),
-            patch.object(service, "platforms", ["tiktok"]),
-            patch.object(service, "youtube_privacy_status", "private"),
-            patch.object(tm.upload_post, "cross_post_video") as cross_post,
+            patch.object(
+                tm.social_publishing,
+                "publishing_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                tm.social_publishing,
+                "configured_platforms",
+                return_value=["tiktok"],
+            ),
+            patch.object(
+                tm.social_publishing,
+                "youtube_privacy_status",
+                return_value="private",
+            ),
+            patch.object(tm.social_publishing, "publish_video") as publish_video,
             patch.object(tm.sm, "state", state),
             patch.object(
                 tm._cross_post_executor,
@@ -1381,7 +1419,7 @@ class TestTaskService(unittest.TestCase):
             result = tm.start("deferred-cross-post", params)
 
         submit.assert_called_once()
-        cross_post.assert_not_called()
+        publish_video.assert_not_called()
         self.assertEqual(result["videos"], ["final.mp4"])
         self.assertEqual(result["cross_post_state"], tm.const.CROSS_POST_STATE_PENDING)
         completed_task = state.get_task("deferred-cross-post")
@@ -1401,9 +1439,15 @@ class TestTaskService(unittest.TestCase):
                 },
             ),
             patch.object(
-                tm.upload_post,
-                "cross_post_video",
-                return_value={"success": True, "request_id": "upload-1"},
+                tm.social_publishing,
+                "publish_video",
+                return_value={
+                    "success": True,
+                    "platform": "tiktok",
+                    "provider": "upload_post",
+                    "status": "accepted",
+                    "request_id": "upload-1",
+                },
             ),
         ):
             worker(*worker_args)
@@ -1652,8 +1696,8 @@ class TestTaskService(unittest.TestCase):
 
     def test_cross_post_generates_caption_for_non_youtube_platforms(self):
         """
-        TikTok/Instagram 发布同样要生成一次社交文案，并把 caption 作为所有
-        成片共享的发布标题，而不是直接发送原始主题。
+        TikTok/Instagram 各自生成适配平台的社交文案，并把 caption 作为
+        发布标题，而不是直接发送原始主题。
         """
         metadata = {
             "title": "Coffee Hook",
@@ -1662,12 +1706,17 @@ class TestTaskService(unittest.TestCase):
         }
         state = MemoryState()
         cases = {
-            "tiktok-first": (("tiktok", "instagram"), "tiktok"),
-            "instagram-first": (("instagram", "tiktok"), "instagram_reels"),
+            "tiktok-first": ("tiktok", "instagram_reels"),
+            "instagram-first": ("instagram_reels", "tiktok"),
         }
 
-        for case_name, (platforms, expected_platform) in cases.items():
+        for case_name, expected_metadata_platforms in cases.items():
             with self.subTest(case=case_name):
+                platforms = (
+                    ("tiktok", "instagram")
+                    if case_name == "tiktok-first"
+                    else ("instagram", "tiktok")
+                )
                 task_id = f"caption-{case_name}"
                 state.update_task(
                     task_id,
@@ -1684,10 +1733,14 @@ class TestTaskService(unittest.TestCase):
                         return_value=metadata,
                     ) as generate_metadata,
                     patch.object(
-                        tm.upload_post,
-                        "cross_post_video",
-                        return_value={"success": True},
-                    ) as cross_post,
+                        tm.social_publishing,
+                        "publish_video",
+                        return_value={
+                            "success": True,
+                            "provider": "upload_post",
+                            "status": "accepted",
+                        },
+                    ) as publish_video,
                 ):
                     tm._run_cross_post(
                         task_id,
@@ -1699,17 +1752,16 @@ class TestTaskService(unittest.TestCase):
                         "private",
                     )
 
-                generate_metadata.assert_called_once_with(
-                    video_subject="Coffee",
-                    video_script="A short coffee story.",
-                    language="en",
-                    platform=expected_platform,
+                self.assertEqual(generate_metadata.call_count, 2)
+                self.assertEqual(
+                    [call.kwargs["platform"] for call in generate_metadata.call_args_list],
+                    list(expected_metadata_platforms),
                 )
-                cross_post.assert_called_once()
-                call = cross_post.call_args
-                self.assertEqual(call.kwargs["title"], "Watch this coffee ritual.")
-                self.assertEqual(call.kwargs["platforms"], list(platforms))
-                self.assertIsNone(call.kwargs["youtube_extra"])
+                self.assertEqual(publish_video.call_count, 2)
+                for call, platform in zip(publish_video.call_args_list, platforms):
+                    self.assertEqual(call.kwargs["platform"], platform)
+                    self.assertEqual(call.kwargs["metadata"], metadata)
+                    self.assertEqual(call.kwargs["youtube_privacy_status"], "private")
                 task = state.get_task(task_id)
                 self.assertEqual(
                     task["cross_post_state"], tm.const.CROSS_POST_STATE_COMPLETE
@@ -1739,10 +1791,14 @@ class TestTaskService(unittest.TestCase):
                 return_value=metadata,
             ) as generate_metadata,
             patch.object(
-                tm.upload_post,
-                "cross_post_video",
-                return_value={"success": True},
-            ) as cross_post,
+                tm.social_publishing,
+                "publish_video",
+                return_value={
+                    "success": True,
+                    "provider": "upload_post",
+                    "status": "accepted",
+                },
+            ) as publish_video,
         ):
             tm._run_cross_post(
                 "shared-youtube-metadata",
@@ -1760,17 +1816,11 @@ class TestTaskService(unittest.TestCase):
             language="en",
             platform="youtube_shorts",
         )
-        expected_extra = {
-            "youtube_title": "Morning Coffee",
-            "youtube_description": "A better morning.",
-            "tags": ["#coffee", "#shorts"],
-            "privacyStatus": "unlisted",
-            "containsSyntheticMedia": True,
-        }
-        self.assertEqual(cross_post.call_count, 2)
-        for call in cross_post.call_args_list:
-            self.assertEqual(call.kwargs["title"], "A better morning.")
-            self.assertEqual(call.kwargs["youtube_extra"], expected_extra)
+        self.assertEqual(publish_video.call_count, 2)
+        for call in publish_video.call_args_list:
+            self.assertEqual(call.kwargs["platform"], "youtube")
+            self.assertEqual(call.kwargs["metadata"], metadata)
+            self.assertEqual(call.kwargs["youtube_privacy_status"], "unlisted")
 
     def test_cross_post_empty_metadata_degrades_to_fallback_title(self):
         """元数据缺失或为空时逐级退回，最终保留旧的通用兜底标题。"""

@@ -45,11 +45,13 @@ from app.models.schema import (
 from app.services import bgm as bgm_service
 from app.services import (
     cache_manager,
+    instagram_publisher,
     llm,
     loomloom,
     video,
     voice,
     webui_task,
+    youtube_publisher,
 )
 from app.services import elevenlabs_music as elevenlabs_music_service
 from app.services import preset as preset_service
@@ -170,6 +172,8 @@ CREDENTIAL_KEY_SUFFIXES = (
     "api_token",
     "access_key",
     "secret_key",
+    "client_secret",
+    "app_secret",
     "speech_key",
 )
 # 只恢复密钥而不恢复配套配置项时，凭据仍然不可用。这些配套项与密钥一起备份。
@@ -184,6 +188,14 @@ CREDENTIAL_COMPANION_KEYS = {
         provider.config_key(field.config_suffix)
         for provider in LLM_PROVIDER_REGISTRY
         for field in provider.extra_fields
+    ),
+}
+PUBLISHING_CREDENTIAL_COMPANION_KEYS = {
+    "app": (
+        "youtube_direct_client_id",
+        "youtube_direct_redirect_uri",
+        "instagram_direct_app_id",
+        "instagram_direct_redirect_uri",
     ),
 }
 # 同一个密钥在不同面板可能使用各自的控件 key：音频面板直接编辑 Gemini 和
@@ -2332,7 +2344,9 @@ def _is_backup_config_key(section_name, key):
     """凭据本身及其配套配置项都属于密钥备份范围。"""
     if _is_credential_config_key(key):
         return True
-    return key in CREDENTIAL_COMPANION_KEYS.get(section_name, ())
+    return key in CREDENTIAL_COMPANION_KEYS.get(
+        section_name, ()
+    ) or key in PUBLISHING_CREDENTIAL_COMPANION_KEYS.get(section_name, ())
 
 
 def _credential_widget_state_keys(section_name, key):
@@ -2710,6 +2724,334 @@ def _render_key_backup_settings(panel):
         st.rerun(scope="app")
 
 
+def _publishing_text(english: str, portuguese: str) -> str:
+    """Keep the first publishing setup focused on the two maintained UI languages."""
+    return portuguese if st.session_state.get("ui_language") == "pt" else english
+
+
+def _clear_social_oauth_query_params() -> None:
+    for key in ("code", "state", "scope", "error", "error_description"):
+        try:
+            st.query_params.pop(key, None)
+        except (AttributeError, KeyError):
+            pass
+
+
+def _handle_social_oauth_callback() -> None:
+    """Complete OAuth callbacks even when the provider opens a new browser tab."""
+    query_state = str(st.query_params.get("state", "") or "")
+    query_code = str(st.query_params.get("code", "") or "")
+    query_error = str(st.query_params.get("error", "") or "")
+    if not query_state or not (query_code or query_error):
+        return
+
+    providers = (
+        ("youtube", youtube_publisher.youtube_publisher),
+        ("instagram", instagram_publisher.instagram_publisher),
+    )
+    matched_provider = ""
+    matched_service = None
+    for provider, service in providers:
+        if service.consume_authorization_state(query_state):
+            matched_provider = provider
+            matched_service = service
+            break
+
+    if not matched_service:
+        st.session_state["social_oauth_callback_error"] = _publishing_text(
+            "The authorization return expired or could not be validated. Connect again.",
+            "O retorno da autorização expirou ou não pôde ser validado. Conecte novamente.",
+        )
+    elif query_error:
+        detail = str(st.query_params.get("error_description", "") or query_error)
+        st.session_state[f"{matched_provider}_oauth_error"] = detail
+    else:
+        try:
+            matched_service.exchange_code(query_code)
+        except Exception as exc:
+            logger.exception(f"failed to authorize {matched_provider} account: {exc}")
+            st.session_state[f"{matched_provider}_oauth_error"] = str(exc)
+        else:
+            st.session_state[f"{matched_provider}_oauth_message"] = "connected"
+
+    st.session_state["settings_dialog_open"] = True
+    _clear_social_oauth_query_params()
+
+
+def _render_social_publishing_settings(panel):
+    """Configure social destinations and complete the direct YouTube OAuth flow."""
+    service = youtube_publisher.youtube_publisher
+    with panel:
+        st.caption(
+            _publishing_text(
+                "Use official platform APIs to avoid per-post service charges. "
+                "Upload-Post remains available as a fallback until each direct "
+                "integration is enabled.",
+                "Use as APIs oficiais para evitar cobrança por postagem. O "
+                "Upload-Post permanece como contingência até cada integração "
+                "direta ser ativada.",
+            )
+        )
+
+        auto_publish = st.checkbox(
+            _publishing_text("Publish automatically", "Publicar automaticamente"),
+            value=bool(
+                config.app.get(
+                    "social_auto_publish",
+                    config.app.get("upload_post_auto_upload", False),
+                )
+            ),
+            key="social_auto_publish_checkbox",
+            help=_publishing_text(
+                "Publishes after the final video is rendered.",
+                "Publica depois que o vídeo final termina de renderizar.",
+            ),
+        )
+        _set_runtime_config("app", "social_auto_publish", auto_publish)
+
+        configured_platforms = config.app.get(
+            "social_publish_platforms",
+            config.app.get("upload_post_platforms", ["youtube", "instagram"]),
+        )
+        selected_platforms = st.multiselect(
+            _publishing_text("Automatic destinations", "Destinos automáticos"),
+            options=["youtube", "instagram"],
+            default=[
+                platform
+                for platform in configured_platforms
+                if platform in {"youtube", "instagram"}
+            ],
+            format_func=lambda platform: {
+                "youtube": "YouTube",
+                "instagram": "Instagram",
+            }[platform],
+            key="social_publish_platforms_multiselect",
+        )
+        _set_runtime_config("app", "social_publish_platforms", selected_platforms)
+
+        st.divider()
+        st.subheader("YouTube")
+        youtube_enabled = st.checkbox(
+            _publishing_text(
+                "Use direct YouTube API",
+                "Usar API direta do YouTube",
+            ),
+            value=bool(config.app.get("youtube_direct_enabled", False)),
+            key="youtube_direct_enabled_checkbox",
+        )
+        _set_runtime_config("app", "youtube_direct_enabled", youtube_enabled)
+
+        client_id = st.text_input(
+            "OAuth Client ID",
+            value=config.app.get("youtube_direct_client_id", ""),
+            key="youtube_direct_client_id_input",
+        ).strip()
+        client_secret = st.text_input(
+            "OAuth Client Secret",
+            value=config.app.get("youtube_direct_client_secret", ""),
+            type="password",
+            key="youtube_direct_client_secret_input",
+        ).strip()
+        redirect_uri = st.text_input(
+            "OAuth Redirect URI",
+            value=config.app.get(
+                "youtube_direct_redirect_uri", "http://localhost:8501"
+            ),
+            key="youtube_direct_redirect_uri_input",
+            help=_publishing_text(
+                "Register this exact URI in the Google Cloud OAuth client.",
+                "Cadastre exatamente este endereço no cliente OAuth do Google Cloud.",
+            ),
+        ).strip()
+        privacy_status = st.selectbox(
+            _publishing_text("YouTube visibility", "Visibilidade no YouTube"),
+            options=["private", "unlisted", "public"],
+            index=["private", "unlisted", "public"].index(
+                config.app.get("youtube_direct_privacy_status", "private")
+                if config.app.get("youtube_direct_privacy_status", "private")
+                in {"private", "unlisted", "public"}
+                else "private"
+            ),
+            format_func=lambda value: {
+                "private": _publishing_text("Private", "Privado"),
+                "unlisted": _publishing_text("Unlisted", "Não listado"),
+                "public": _publishing_text("Public", "Público"),
+            }[value],
+            key="youtube_direct_privacy_select",
+        )
+        _set_runtime_config("app", "youtube_direct_client_id", client_id)
+        _set_runtime_config("app", "youtube_direct_client_secret", client_secret)
+        _set_runtime_config("app", "youtube_direct_redirect_uri", redirect_uri)
+        _set_runtime_config("app", "youtube_direct_privacy_status", privacy_status)
+
+        if st.session_state.pop("youtube_oauth_message", "") == "connected":
+            st.success(
+                _publishing_text(
+                    "YouTube account connected.",
+                    "Conta do YouTube conectada.",
+                )
+            )
+
+        youtube_oauth_error = st.session_state.pop("youtube_oauth_error", "")
+        if youtube_oauth_error:
+            st.error(
+                _publishing_text(
+                    f"YouTube authorization failed: {youtube_oauth_error}",
+                    f"A autorização do YouTube falhou: {youtube_oauth_error}",
+                )
+            )
+
+        if service.is_authorized():
+            st.success(
+                _publishing_text(
+                    "Direct YouTube publishing is authorized.",
+                    "A publicação direta no YouTube está autorizada.",
+                )
+            )
+            if st.button(
+                _publishing_text("Disconnect YouTube", "Desconectar YouTube"),
+                key="disconnect_youtube_button",
+                use_container_width=True,
+            ):
+                try:
+                    service.disconnect()
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    st.rerun(scope="app")
+        elif client_id and client_secret and redirect_uri:
+            oauth_state = service.begin_authorization()
+            try:
+                authorization_url = service.build_authorization_url(oauth_state)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.link_button(
+                    _publishing_text("Connect YouTube", "Conectar YouTube"),
+                    authorization_url,
+                    use_container_width=True,
+                    type="primary",
+                )
+        else:
+            st.info(
+                _publishing_text(
+                    "Enter the OAuth Client ID and Client Secret to connect YouTube.",
+                    "Informe o Client ID e o Client Secret OAuth para conectar o YouTube.",
+                )
+            )
+
+        st.divider()
+        st.subheader("Instagram")
+        instagram_service = instagram_publisher.instagram_publisher
+        instagram_enabled = st.checkbox(
+            _publishing_text(
+                "Use direct Instagram API",
+                "Usar API direta do Instagram",
+            ),
+            value=bool(config.app.get("instagram_direct_enabled", False)),
+            key="instagram_direct_enabled_checkbox",
+        )
+        _set_runtime_config("app", "instagram_direct_enabled", instagram_enabled)
+        meta_app_id = st.text_input(
+            "Instagram App ID",
+            value=config.app.get("instagram_direct_app_id", ""),
+            key="instagram_direct_app_id_input",
+        ).strip()
+        meta_app_secret = st.text_input(
+            "Instagram App Secret",
+            value=config.app.get("instagram_direct_app_secret", ""),
+            type="password",
+            key="instagram_direct_app_secret_input",
+        ).strip()
+        instagram_redirect_uri = st.text_input(
+            "Instagram OAuth Redirect URI",
+            value=config.app.get(
+                "instagram_direct_redirect_uri", "http://localhost:8501/"
+            ),
+            key="instagram_direct_redirect_uri_input",
+            help=_publishing_text(
+                "Register this exact URI under Instagram > API setup with Instagram Login > Business login settings.",
+                "Cadastre exatamente este endereço em Instagram > Configuração da API com o Instagram Login > Configurações do login empresarial.",
+            ),
+        ).strip()
+        share_to_feed = st.checkbox(
+            _publishing_text("Also show in feed", "Também mostrar no feed"),
+            value=bool(config.app.get("instagram_direct_share_to_feed", True)),
+            key="instagram_direct_share_to_feed_checkbox",
+        )
+        _set_runtime_config("app", "instagram_direct_app_id", meta_app_id)
+        _set_runtime_config("app", "instagram_direct_app_secret", meta_app_secret)
+        _set_runtime_config(
+            "app", "instagram_direct_redirect_uri", instagram_redirect_uri
+        )
+        _set_runtime_config("app", "instagram_direct_share_to_feed", share_to_feed)
+
+        st.caption(
+            _publishing_text(
+                "Uses Instagram Login and does not require a Facebook Page. During publishing, only the selected video is exposed through a temporary Cloudflare URL.",
+                "Usa o Instagram Login e não exige Página do Facebook. Durante a publicação, somente o vídeo selecionado fica exposto por uma URL temporária da Cloudflare.",
+            )
+        )
+
+        if st.session_state.pop("instagram_oauth_message", "") == "connected":
+            st.success(
+                _publishing_text(
+                    "Instagram account connected.",
+                    "Conta do Instagram conectada.",
+                )
+            )
+
+        instagram_oauth_error = st.session_state.pop("instagram_oauth_error", "")
+        if instagram_oauth_error:
+            st.error(
+                _publishing_text(
+                    f"Instagram authorization failed: {instagram_oauth_error}",
+                    f"A autorização do Instagram falhou: {instagram_oauth_error}",
+                )
+            )
+
+        if instagram_service.is_authorized():
+            account = instagram_service.account_summary()
+            account_name = account.get("username") or account.get("ig_user_id")
+            st.success(
+                _publishing_text(
+                    f"Direct Instagram publishing is authorized: {account_name}",
+                    f"A publicação direta no Instagram está autorizada: {account_name}",
+                )
+            )
+            if st.button(
+                _publishing_text("Disconnect Instagram", "Desconectar Instagram"),
+                key="disconnect_instagram_button",
+                use_container_width=True,
+            ):
+                try:
+                    instagram_service.disconnect()
+                except Exception as exc:
+                    st.error(str(exc))
+                else:
+                    st.rerun(scope="app")
+        elif meta_app_id and meta_app_secret and instagram_redirect_uri:
+            oauth_state = instagram_service.begin_authorization()
+            try:
+                authorization_url = instagram_service.build_authorization_url(oauth_state)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.link_button(
+                    _publishing_text("Connect Instagram", "Conectar Instagram"),
+                    authorization_url,
+                    use_container_width=True,
+                    type="primary",
+                )
+        else:
+            st.info(
+                _publishing_text(
+                    "Enter the Instagram App ID and App Secret to connect Instagram.",
+                    "Informe o Instagram App ID e o Instagram App Secret para conectar o Instagram.",
+                )
+            )
+
+
 # -----------------------------------------------------------------------------
 # 设置与提示词弹窗
 # -----------------------------------------------------------------------------
@@ -2732,6 +3074,7 @@ def _render_settings_dialog():
         (
             middle_config_panel,
             right_config_panel,
+            publishing_config_panel,
             key_backup_panel,
             cache_config_panel,
             left_config_panel,
@@ -2739,6 +3082,7 @@ def _render_settings_dialog():
             [
                 tr("LLM Settings Tab"),
                 tr("Material API Tab"),
+                _publishing_text("Publishing", "Publicação"),
                 tr("Key Backup Tab"),
                 tr("Cache Management Tab"),
                 tr("Interface Settings Tab"),
@@ -2755,6 +3099,7 @@ def _render_settings_dialog():
             _set_runtime_config("ui", "hide_log", hide_log)
 
         _render_cache_management_settings(cache_config_panel)
+        _render_social_publishing_settings(publishing_config_panel)
         # 密钥恢复会写回配置并清除密码控件状态，必须在下面渲染这些控件之前执行。
         _render_key_backup_settings(key_backup_panel)
 
@@ -6264,7 +6609,12 @@ def _render_generation_controls(
 
 def _render_application():
     """按固定顺序渲染顶部栏、弹窗、生成表单和任务结果。"""
+    _handle_social_oauth_callback()
     _render_top_bar()
+
+    oauth_callback_error = st.session_state.pop("social_oauth_callback_error", "")
+    if oauth_callback_error:
+        st.error(oauth_callback_error)
 
     if st.session_state.get("settings_dialog_open", False):
         _render_settings_dialog()

@@ -332,6 +332,34 @@ upload_post_youtube_privacy_status = "public"
 # Cross-post jobs run in the current process and are not resumed after restart.
 upload_post_max_pending_tasks = 10
 
+# Social publishing orchestration. When omitted, the legacy Upload-Post platform
+# list and automatic-upload switch above remain in effect.
+social_auto_publish = false
+social_publish_platforms = ["youtube", "instagram"]
+
+# Direct YouTube publishing through the official YouTube Data API. Create an
+# OAuth 2.0 Web application in Google Cloud and register the redirect URI below.
+# The OAuth token is saved under storage/credentials and is ignored by Git.
+youtube_direct_enabled = false
+youtube_direct_client_id = ""
+youtube_direct_client_secret = ""
+youtube_direct_redirect_uri = "http://localhost:8501"
+youtube_direct_privacy_status = "private"
+youtube_direct_category_id = "22"
+youtube_direct_token_file = "youtube-token.json"
+
+# Direct Instagram Reels publishing through Instagram Login. Use the Instagram
+# App ID and App Secret shown under Instagram > API setup with Instagram Login;
+# no Facebook Page is required. A Cloudflare Quick Tunnel exposes only the video
+# while Instagram imports it. The token is stored under storage/credentials.
+instagram_direct_enabled = false
+instagram_direct_app_id = ""
+instagram_direct_app_secret = ""
+instagram_direct_redirect_uri = "http://localhost:8501/"
+instagram_direct_api_version = "v26.0"
+instagram_direct_share_to_feed = true
+instagram_direct_token_file = "instagram-token.json"
+
 # =============================================================================
 # Whisper Subtitles / Whisper 字幕
 # =============================================================================

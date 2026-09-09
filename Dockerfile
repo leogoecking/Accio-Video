@@ -15,7 +15,7 @@ ARG PIP_USE_OFFICIAL=1
 RUN set -u; \
     install_system_dependencies() { \
         apt-get update && \
-        apt-get install -y --no-install-recommends git ffmpeg; \
+        apt-get install -y --no-install-recommends ca-certificates curl git ffmpeg; \
     }; \
     retry_system_dependencies() { \
         attempt=1; \
@@ -56,6 +56,21 @@ RUN set -u; \
         fi; \
     fi; \
     rm -rf /var/lib/apt/lists/*
+
+# Instagram Login requires Meta to fetch the generated video from a public URL.
+# A Quick Tunnel exposes only the selected file while Instagram processes it.
+ARG CLOUDFLARED_VERSION=2026.8.3
+RUN arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) cloudflared_arch="amd64" ;; \
+        arm64) cloudflared_arch="arm64" ;; \
+        *) echo "Unsupported cloudflared architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl --fail --location --retry 3 \
+        --output /usr/local/bin/cloudflared \
+        "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${cloudflared_arch}"; \
+    chmod 0755 /usr/local/bin/cloudflared; \
+    cloudflared --version
 
 # Copy only the requirements.txt first to leverage Docker cache
 COPY requirements.txt ./

@@ -34,6 +34,7 @@ SETTINGS_TRANSFER_CONSTANTS = {
     "PRESET_EXCLUDED_PARAM_KEYS",
     "CREDENTIAL_KEY_SUFFIXES",
     "CREDENTIAL_COMPANION_KEYS",
+    "PUBLISHING_CREDENTIAL_COMPANION_KEYS",
     "CREDENTIAL_WIDGET_STATE_ALIASES",
     "KEY_BACKUP_EXCLUDED_SECTIONS",
 }
@@ -256,6 +257,13 @@ def test_key_backup_companion_keys_stay_in_sync_with_the_provider_registry():
 
     assert companion_app_keys == registry_extra_keys
     assert registry_extra_keys
+
+    assert set(NAMESPACE["PUBLISHING_CREDENTIAL_COMPANION_KEYS"]["app"]) == {
+        "youtube_direct_client_id",
+        "youtube_direct_redirect_uri",
+        "instagram_direct_app_id",
+        "instagram_direct_redirect_uri",
+    }
 
 
 def test_key_backup_skips_interface_preferences_section():
