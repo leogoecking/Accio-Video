@@ -770,6 +770,42 @@ DEFAULT_SOCIAL_HASHTAGS = [
     "#creator",
     "#content",
 ]
+SOCIAL_HASHTAG_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "como",
+        "da",
+        "das",
+        "de",
+        "do",
+        "dos",
+        "e",
+        "em",
+        "for",
+        "from",
+        "how",
+        "in",
+        "na",
+        "nas",
+        "no",
+        "nos",
+        "o",
+        "of",
+        "on",
+        "or",
+        "para",
+        "por",
+        "the",
+        "to",
+        "um",
+        "uma",
+        "with",
+    }
+)
 
 
 def _resolve_social_platform(platform: str | None) -> str:
@@ -819,7 +855,7 @@ def _clamp_text(text, max_length: int) -> str:
     return value
 
 
-def _normalize_hashtags(raw, count: int) -> List[str]:
+def normalize_hashtags(raw, count: int) -> List[str]:
     """
     将 LLM 返回的 hashtag 统一整理成 `#tag` 格式。
 
@@ -839,7 +875,7 @@ def _normalize_hashtags(raw, count: int) -> List[str]:
     seen = set()
     result: List[str] = []
     for item in candidates:
-        tag = re.sub(r"[^\w]", "", item, flags=re.UNICODE)
+        tag = re.sub(r"[^\w]", "", item, flags=re.UNICODE)[:100]
         if not tag:
             continue
         key = tag.lower()
@@ -850,6 +886,30 @@ def _normalize_hashtags(raw, count: int) -> List[str]:
         if count and len(result) >= count:
             break
     return result
+
+
+# Compatibility for internal callers and integrations created before the helper
+# became part of the social publishing flow.
+_normalize_hashtags = normalize_hashtags
+
+
+def _fallback_topic_hashtags(subject: str, script: str, count: int) -> List[str]:
+    """Build useful local tags when the configured LLM is unavailable."""
+    source = (subject or script or "").strip()
+    words = re.findall(r"[^\W_]+", source, flags=re.UNICODE)
+    relevant = [
+        word
+        for word in words
+        if len(word) >= 3 and word.casefold() not in SOCIAL_HASHTAG_STOP_WORDS
+    ][:6]
+
+    candidates = []
+    if len(relevant) >= 2:
+        topic = "".join(word[:1].upper() + word[1:] for word in relevant[:4])
+        candidates.append(topic)
+    candidates.extend(relevant)
+    candidates.extend(DEFAULT_SOCIAL_HASHTAGS)
+    return normalize_hashtags(candidates, count)
 
 
 def build_social_metadata_prompt(
@@ -914,7 +974,7 @@ def _parse_social_metadata(response: str, platform: str) -> dict:
 
     title = _clamp_text(data.get("title", ""), spec["title_max"])
     caption = _clamp_text(data.get("caption", ""), spec["caption_max"])
-    hashtags = _normalize_hashtags(data.get("hashtags", []), spec["hashtag_count"])
+    hashtags = normalize_hashtags(data.get("hashtags", []), spec["hashtag_count"])
 
     if not title and not caption:
         raise ValueError("social metadata response is missing both title and caption")
@@ -937,7 +997,11 @@ def _fallback_social_metadata(
     return {
         "title": _clamp_text(title, spec["title_max"]),
         "caption": _clamp_text(script or subject, spec["caption_max"]),
-        "hashtags": _normalize_hashtags(DEFAULT_SOCIAL_HASHTAGS, spec["hashtag_count"]),
+        "hashtags": _fallback_topic_hashtags(
+            subject,
+            script,
+            spec["hashtag_count"],
+        ),
     }
 
 

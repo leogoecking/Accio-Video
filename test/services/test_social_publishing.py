@@ -5,6 +5,27 @@ from app.services import social_publishing
 
 
 class TestSocialPublishing(unittest.TestCase):
+    def test_compose_caption_appends_normalized_unique_hashtags(self):
+        caption = social_publishing.compose_caption(
+            {
+                "caption": "Veja estas dicas #economia",
+                "hashtags": ["#Economia", "energia limpa", "energia limpa"],
+            }
+        )
+
+        self.assertEqual(
+            caption,
+            "Veja estas dicas #economia\n\n#energialimpa",
+        )
+
+    def test_compose_caption_reserves_space_for_hashtags(self):
+        caption = social_publishing.compose_caption(
+            {"caption": "x" * 2200, "hashtags": ["#energia", "#economia"]}
+        )
+
+        self.assertEqual(len(caption), 2200)
+        self.assertTrue(caption.endswith("#energia #economia"))
+
     @patch("app.services.social_publishing.config.app")
     def test_configured_platforms_normalizes_and_deduplicates(self, config_app):
         config_app.get.return_value = ["YouTube", "instagram", "youtube", "unknown"]
@@ -61,7 +82,7 @@ class TestSocialPublishing(unittest.TestCase):
         result = social_publishing.publish_video(
             platform="instagram",
             video_path="video.mp4",
-            metadata={"title": "T", "caption": "C", "hashtags": []},
+            metadata={"title": "T", "caption": "C", "hashtags": ["#topic"]},
             youtube_privacy_status="private",
         )
 
@@ -70,8 +91,30 @@ class TestSocialPublishing(unittest.TestCase):
         self.assertEqual(result["status"], "accepted")
         fallback.assert_called_once_with(
             video_path="video.mp4",
-            title="C",
+            title="C\n\n#topic",
             platforms=["instagram"],
+            youtube_extra=None,
+        )
+
+    @patch.object(social_publishing.upload_post, "cross_post_video")
+    def test_upload_post_tiktok_receives_hashtags_in_caption(self, fallback):
+        fallback.return_value = {"success": True}
+
+        social_publishing.publish_video(
+            platform="tiktok",
+            video_path="video.mp4",
+            metadata={
+                "title": "Energy",
+                "caption": "Reduce your energy bill.",
+                "hashtags": ["#energy", "#saving"],
+            },
+            youtube_privacy_status="private",
+        )
+
+        fallback.assert_called_once_with(
+            video_path="video.mp4",
+            title="Reduce your energy bill.\n\n#energy #saving",
+            platforms=["tiktok"],
             youtube_extra=None,
         )
 
@@ -89,12 +132,19 @@ class TestSocialPublishing(unittest.TestCase):
             result = social_publishing.publish_video(
                 platform="instagram",
                 video_path="video.mp4",
-                metadata={"title": "T", "caption": "Caption", "hashtags": []},
+                metadata={
+                    "title": "T",
+                    "caption": "Caption",
+                    "hashtags": ["#topic", "#reels"],
+                },
                 youtube_privacy_status="private",
             )
 
         self.assertTrue(result["success"])
-        instagram_upload.assert_called_once_with("video.mp4", caption="Caption")
+        instagram_upload.assert_called_once_with(
+            "video.mp4",
+            caption="Caption\n\n#topic #reels",
+        )
         fallback.assert_not_called()
 
 

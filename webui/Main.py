@@ -48,6 +48,7 @@ from app.services import (
     instagram_publisher,
     llm,
     loomloom,
+    social_publishing,
     tiktok_publisher,
     video,
     voice,
@@ -1719,6 +1720,53 @@ def _save_tiktok_result(task_id, task, video_path, result):
     task["tiktok_direct_results"] = results
 
 
+def _social_metadata_for_video(task, video_path, platform):
+    results = task.get("social_metadata_results") or []
+    for result in results:
+        if (
+            isinstance(result, Mapping)
+            and result.get("video_path") == video_path
+            and result.get("platform") == platform
+        ):
+            return dict(result)
+    return {}
+
+
+def _save_social_metadata(task_id, task, video_path, platform, metadata):
+    results = [
+        dict(item)
+        for item in (task.get("social_metadata_results") or [])
+        if isinstance(item, Mapping)
+        and not (
+            item.get("video_path") == video_path and item.get("platform") == platform
+        )
+    ]
+    normalized = {
+        "video_path": video_path,
+        "platform": platform,
+        "title": str(metadata.get("title") or "").strip(),
+        "caption": str(metadata.get("caption") or "").strip(),
+        "hashtags": llm.normalize_hashtags(metadata.get("hashtags", []), count=30),
+    }
+    results.append(normalized)
+    if not sm.state.patch_task(task_id, social_metadata_results=results):
+        raise RuntimeError("The completed video task is no longer available")
+    task["social_metadata_results"] = results
+    return normalized
+
+
+def _generate_tiktok_social_metadata(task_id, task, video_path):
+    generated = llm.generate_social_metadata(
+        video_subject=str(task.get("video_subject") or ""),
+        video_script=str(task.get("script") or ""),
+        language="auto",
+        platform="tiktok",
+    )
+    if not isinstance(generated, Mapping):
+        raise RuntimeError("The caption generator returned an invalid response")
+    return _save_social_metadata(task_id, task, video_path, "tiktok", generated)
+
+
 def _refresh_tiktok_result(task_id, task, video_path, existing_result, service):
     current = service.get_post_status(existing_result.get("publish_id", ""))
     processing_status = str(current.get("status") or "PROCESSING_UPLOAD")
@@ -1758,7 +1806,10 @@ def _render_tiktok_publish_panel(task_id, task, video_files):
     for index, video_path in enumerate(video_files):
         panel_key = f"tiktok_{task_id}_{index}"
         creator_key = f"{panel_key}_creator_info"
+        caption_key = f"{panel_key}_title"
+        hashtags_key = f"{panel_key}_hashtags"
         existing_result = _tiktok_result_for_video(task, video_path)
+        social_metadata = _social_metadata_for_video(task, video_path, "tiktok")
         label = _publishing_text(
             f"TikTok — video {index + 1}",
             f"TikTok — vídeo {index + 1}",
@@ -1841,9 +1892,25 @@ def _render_tiktok_publish_panel(task_id, task, video_files):
             ):
                 try:
                     st.session_state[creator_key] = service.get_creator_info()
+                    if not social_metadata:
+                        social_metadata = _generate_tiktok_social_metadata(
+                            task_id,
+                            task,
+                            video_path,
+                        )
+                    st.session_state[caption_key] = str(
+                        social_metadata.get("caption")
+                        or social_metadata.get("title")
+                        or task.get("video_subject")
+                        or task.get("script")
+                        or ""
+                    ).strip()
+                    st.session_state[hashtags_key] = " ".join(
+                        social_metadata.get("hashtags") or []
+                    )
                 except Exception as exc:
                     logger.error(
-                        f"failed to load TikTok creator information: task_id={task_id}, error={exc}"
+                        f"failed to prepare TikTok post: task_id={task_id}, error={exc}"
                     )
                     st.error(str(exc))
 
@@ -1861,14 +1928,66 @@ def _render_tiktok_publish_panel(task_id, task, video_files):
                 )
             )
 
+            if not social_metadata:
+                social_metadata = _social_metadata_for_video(task, video_path, "tiktok")
+
             title_default = str(
-                task.get("video_subject") or task.get("script") or ""
+                social_metadata.get("caption")
+                or social_metadata.get("title")
+                or task.get("video_subject")
+                or task.get("script")
+                or ""
             ).strip()
+            st.session_state.setdefault(caption_key, title_default)
+            st.session_state.setdefault(
+                hashtags_key,
+                " ".join(social_metadata.get("hashtags") or []),
+            )
+
+            if st.button(
+                _publishing_text(
+                    "Generate caption and hashtags again",
+                    "Gerar legenda e hashtags novamente",
+                ),
+                key=f"{panel_key}_regenerate_metadata",
+                use_container_width=True,
+            ):
+                try:
+                    social_metadata = _generate_tiktok_social_metadata(
+                        task_id,
+                        task,
+                        video_path,
+                    )
+                    st.session_state[caption_key] = str(
+                        social_metadata.get("caption")
+                        or social_metadata.get("title")
+                        or ""
+                    ).strip()
+                    st.session_state[hashtags_key] = " ".join(
+                        social_metadata.get("hashtags") or []
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"failed to regenerate TikTok metadata: task_id={task_id}, error={exc}"
+                    )
+                    st.error(str(exc))
+
             title = st.text_area(
                 _publishing_text("Caption", "Legenda"),
-                value=title_default,
                 max_chars=2200,
-                key=f"{panel_key}_title",
+                key=caption_key,
+            )
+            hashtags_text = st.text_input(
+                _publishing_text("Hashtags", "Hashtags"),
+                placeholder="#assunto #dica #video",
+                key=hashtags_key,
+            )
+            hashtags = llm.normalize_hashtags(hashtags_text, count=5)
+            st.caption(
+                _publishing_text(
+                    "Hashtags are generated from the video subject and script. You can edit or remove them before publishing.",
+                    "As hashtags são geradas com base no assunto e no roteiro. Você pode editar ou removê-las antes de publicar.",
+                )
             )
 
             privacy_options = [
@@ -2022,6 +2141,26 @@ def _render_tiktok_publish_panel(task_id, task, video_files):
                 disabled=not privacy or not music_consent or commercial_invalid,
                 use_container_width=True,
             ):
+                edited_metadata = {
+                    "title": social_metadata.get("title") or title,
+                    "caption": title,
+                    "hashtags": hashtags,
+                }
+                try:
+                    _save_social_metadata(
+                        task_id,
+                        task,
+                        video_path,
+                        "tiktok",
+                        edited_metadata,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"failed to save edited TikTok metadata: task_id={task_id}, error={exc}"
+                    )
+                    st.error(str(exc))
+                    continue
+                publish_caption = social_publishing.compose_caption(edited_metadata)
                 with st.spinner(
                     _publishing_text(
                         "Uploading to TikTok...",
@@ -2030,7 +2169,7 @@ def _render_tiktok_publish_panel(task_id, task, video_files):
                 ):
                     result = service.publish_video(
                         video_path,
-                        title=title,
+                        title=publish_caption,
                         privacy_level=privacy,
                         allow_comment=allow_comment,
                         allow_duet=allow_duet,

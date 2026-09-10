@@ -1623,7 +1623,7 @@ class TestSocialMetadata(unittest.TestCase):
         self.assertEqual(result["caption"], "收藏这条路线，下次直接出发！")
         self.assertEqual(result["hashtags"], ["#上海", "#旅行", "#shorts"])
 
-    def test_generate_social_metadata_falls_back_to_generic_hashtags(self):
+    def test_generate_social_metadata_falls_back_to_topic_hashtags(self):
         with patch.object(
             llm, "_generate_response", return_value="Error: api_key is not set"
         ):
@@ -1636,7 +1636,18 @@ class TestSocialMetadata(unittest.TestCase):
         self.assertEqual(result["title"], "Coffee tips")
         self.assertEqual(result["caption"], "Save these three coffee tips.")
         self.assertEqual(len(result["hashtags"]), 8)
-        self.assertEqual(result["hashtags"][0], "#shorts")
+        self.assertEqual(result["hashtags"][:3], ["#CoffeeTips", "#Coffee", "#tips"])
+        self.assertIn("#shorts", result["hashtags"])
+
+    def test_fallback_topic_hashtags_ignore_common_portuguese_words(self):
+        tags = llm._fallback_topic_hashtags(
+            "Como economizar energia elétrica",
+            "",
+            count=5,
+        )
+
+        self.assertEqual(tags[0], "#EconomizarEnergiaElétrica")
+        self.assertNotIn("#Como", tags)
 
     def test_request_model_defaults_to_auto_language_tiktok(self):
         body = VideoSocialMetadataRequest(video_subject="Test")

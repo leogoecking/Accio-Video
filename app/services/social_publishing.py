@@ -2,15 +2,34 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.config import config
-from app.services import upload_post
+from app.services import llm, upload_post
 from app.services.instagram_publisher import instagram_publisher
 from app.services.youtube_publisher import youtube_publisher
 
 
 SUPPORTED_PLATFORMS = frozenset({"youtube", "instagram", "tiktok", "facebook"})
+
+
+def compose_caption(metadata: dict[str, Any], max_length: int = 2200) -> str:
+    """Join an editable caption and its normalized hashtags within platform limits."""
+    caption = str(metadata.get("caption") or metadata.get("title") or "").strip()
+    hashtags = llm.normalize_hashtags(metadata.get("hashtags", []), count=30)
+    existing = {match.casefold() for match in re.findall(r"#[\w]+", caption)}
+    suffix = " ".join(tag for tag in hashtags if tag.casefold() not in existing)
+
+    if not suffix:
+        return caption[:max_length].rstrip()
+    if not caption:
+        return suffix[:max_length].rstrip()
+
+    caption_limit = max(0, max_length - len(suffix) - 2)
+    if caption_limit == 0:
+        return suffix[:max_length].rstrip()
+    return f"{caption[:caption_limit].rstrip()}\n\n{suffix}".rstrip()
 
 
 def configured_platforms() -> list[str]:
@@ -91,15 +110,16 @@ def publish_video(
     if platform == "instagram" and instagram_publisher.enabled:
         return instagram_publisher.upload_video(
             video_path,
-            caption=(metadata.get("caption") or metadata.get("title") or ""),
+            caption=compose_caption(metadata),
         )
 
+    shared_title = metadata.get("caption") or metadata.get("title") or ""
+    if platform != "youtube":
+        shared_title = compose_caption(metadata)
     result = upload_post.cross_post_video(
         video_path=video_path,
         title=(
-            metadata.get("caption")
-            or metadata.get("title")
-            or "Check out this video! #shorts #viral"
+            shared_title or "Check out this video! #shorts #viral"
         ),
         platforms=[platform],
         youtube_extra=(

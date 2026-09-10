@@ -444,6 +444,32 @@ def test_terminal_logger_reload_preserves_task_log_handler():
         logging_utils._terminal_handler_id = previous_handler_id
 
 
+def test_tiktok_confirmation_generates_editable_hashtags_before_publishing():
+    tree = ast.parse(WEBUI_MAIN.read_text(encoding="utf-8"))
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+
+    generator_calls = {
+        _attribute_name(node.func)
+        for node in ast.walk(functions["_generate_tiktok_social_metadata"])
+        if isinstance(node, ast.Call)
+    }
+    panel_calls = {
+        _attribute_name(node.func)
+        for node in ast.walk(functions["_render_tiktok_publish_panel"])
+        if isinstance(node, ast.Call)
+    }
+
+    assert "llm.generate_social_metadata" in generator_calls
+    assert "_save_social_metadata" in generator_calls
+    assert "st.text_input" in panel_calls
+    assert "llm.normalize_hashtags" in panel_calls
+    assert "social_publishing.compose_caption" in panel_calls
+
+
 def test_worker_wrapper_failure_is_saved_instead_of_leaving_processing_state():
     """日志或配置包装层异常也必须转换成可查询的失败终态。"""
     task_id = "worker-wrapper-failure-test"
