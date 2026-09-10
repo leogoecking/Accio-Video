@@ -354,7 +354,7 @@ class TestTikTokPublisher(unittest.TestCase):
     @patch("app.services.tiktok_publisher.os.path.isfile", return_value=True)
     @patch("app.services.tiktok_publisher.os.path.getsize", return_value=4)
     @patch("app.services.tiktok_publisher.config.app")
-    def test_test_mode_rejects_non_private_post(
+    def test_test_mode_rejects_public_creator_account_before_initialization(
         self, config_app, _getsize, _isfile, post
     ):
         config_app.get.side_effect = self.config.get
@@ -375,8 +375,45 @@ class TestTikTokPublisher(unittest.TestCase):
             )
 
         self.assertFalse(result["success"])
-        self.assertIn("SELF_ONLY", result["error"])
+        self.assertIn("account is public", result["error"])
+        self.assertIn("change the account to private", result["error"])
         self.assertEqual(post.call_count, 1)
+
+    def test_creator_visibility_uses_returned_privacy_options(self):
+        self.assertTrue(
+            TikTokPublisher.creator_account_is_private(
+                {
+                    "privacy_level_options": [
+                        "FOLLOWER_OF_CREATOR",
+                        "MUTUAL_FOLLOW_FRIENDS",
+                        "SELF_ONLY",
+                    ]
+                }
+            )
+        )
+        self.assertFalse(
+            TikTokPublisher.creator_account_is_private(
+                {
+                    "privacy_level_options": [
+                        "PUBLIC_TO_EVERYONE",
+                        "MUTUAL_FOLLOW_FRIENDS",
+                        "SELF_ONLY",
+                    ]
+                }
+            )
+        )
+
+    def test_unaudited_public_account_error_is_actionable(self):
+        response = MagicMock(ok=False, status_code=403)
+        response.json.return_value = {
+            "error": {
+                "code": "unaudited_client_can_only_post_to_private_accounts",
+                "message": "request rejected",
+            }
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "change the account to private"):
+            TikTokPublisher._api_payload(response, "TikTok post initialization")
 
     @patch("app.services.tiktok_publisher.logger.error")
     @patch("app.services.tiktok_publisher.time.sleep")

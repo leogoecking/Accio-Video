@@ -33,6 +33,7 @@ class TikTokPublisher:
     STATUS_URL = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
     REQUIRED_SCOPES = ("user.info.basic", "video.publish")
     TEST_PRIVACY_LEVEL = "SELF_ONLY"
+    PUBLIC_PRIVACY_LEVEL = "PUBLIC_TO_EVERYONE"
     TERMINAL_STATUSES = frozenset({"PUBLISH_COMPLETE", "FAILED"})
     MIN_CHUNK_SIZE = 5 * 1024 * 1024
     MAX_CHUNK_SIZE = 64 * 1024 * 1024
@@ -208,6 +209,15 @@ class TikTokPublisher:
             operation="TikTok creator lookup",
         )
 
+    @classmethod
+    def creator_account_is_private(cls, creator: dict) -> bool:
+        options = {
+            str(value).strip().upper()
+            for value in creator.get("privacy_level_options", [])
+            if value
+        }
+        return bool(options) and cls.PUBLIC_PRIVACY_LEVEL not in options
+
     def publish_video(
         self,
         video_path: str,
@@ -239,6 +249,11 @@ class TikTokPublisher:
                 body={},
                 operation="TikTok creator lookup",
             )
+            if self.test_mode and not self.creator_account_is_private(creator):
+                raise ValueError(
+                    "The connected TikTok account is public. While this TikTok app "
+                    "is unaudited, change the account to private before posting."
+                )
             privacy = str(privacy_level or "").strip().upper()
             available_privacy = {
                 str(value).upper()
@@ -619,6 +634,11 @@ class TikTokPublisher:
         if not response.ok or code not in {"", "ok"}:
             safe_code = code or f"HTTP {response.status_code}"
             message = str(error.get("message") or "request rejected")
+            if code == "unaudited_client_can_only_post_to_private_accounts":
+                raise RuntimeError(
+                    "The connected TikTok account is public. While this TikTok app "
+                    "is unaudited, change the account to private before posting."
+                )
             raise RuntimeError(f"{operation} failed ({safe_code}): {message}")
         data = payload.get("data") if isinstance(payload, dict) else None
         return data if isinstance(data, dict) else {}

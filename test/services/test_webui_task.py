@@ -468,6 +468,7 @@ def test_tiktok_confirmation_generates_editable_hashtags_before_publishing():
     assert "st.text_input" in panel_calls
     assert "llm.normalize_hashtags" in panel_calls
     assert "social_publishing.compose_caption" in panel_calls
+    assert "service.creator_account_is_private" in panel_calls
 
 
 def test_worker_wrapper_failure_is_saved_instead_of_leaving_processing_state():

@@ -1928,6 +1928,18 @@ def _render_tiktok_publish_panel(task_id, task, video_files):
                 )
             )
 
+            if service.test_mode and not service.creator_account_is_private(creator):
+                st.error(
+                    _publishing_text(
+                        "This TikTok account is public. Unaudited apps can only post when the connected account is private. Change the account privacy in TikTok, then prepare the post again.",
+                        "Esta conta do TikTok está pública. Aplicativos ainda não auditados só podem publicar quando a conta conectada está privada. Altere a privacidade da conta no TikTok e depois prepare a postagem novamente.",
+                    )
+                )
+                st.markdown(
+                    "[TikTok Content Sharing Guidelines](https://developers.tiktok.com/docs/en/content-sharing-guidelines)"
+                )
+                continue
+
             if not social_metadata:
                 social_metadata = _social_metadata_for_video(task, video_path, "tiktok")
 
