@@ -438,6 +438,7 @@ def test_terminal_logger_reload_preserves_task_log_handler():
         assert handler_id == 456
         remove.assert_called_once_with(123)
         add.assert_called_once()
+        assert add.call_args.kwargs["diagnose"] is False
         assert logging_utils._terminal_handler_id == 456
     finally:
         logging_utils._terminal_handler_id = previous_handler_id

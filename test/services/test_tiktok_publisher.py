@@ -7,6 +7,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import MagicMock, mock_open, patch
 
+import requests
+
 from app.services.oauth_state import OAuthStateStore
 from app.services.tiktok_publisher import TikTokPublisher
 
@@ -111,6 +113,47 @@ class TestTikTokPublisher(unittest.TestCase):
         self.assertEqual(saved["refresh_token"], "refresh-token")
         self.assertEqual(os.stat(self.token_path).st_mode & 0o777, 0o600)
 
+    @patch("app.services.tiktok_publisher.requests.post")
+    @patch("app.services.tiktok_publisher.config.app")
+    def test_exchange_rejects_token_without_required_publish_scope(
+        self, config_app, post
+    ):
+        config_app.get.side_effect = self.config.get
+        response = MagicMock(ok=True, status_code=200)
+        response.json.return_value = {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "scope": "user.info.basic",
+        }
+        post.return_value = response
+        service = TikTokPublisher()
+        token_patch, state_patch = self._path_patches()
+
+        with token_patch, state_patch:
+            state = service.begin_authorization()
+            self.assertTrue(service.consume_authorization_state(state))
+            with self.assertRaisesRegex(RuntimeError, "video.publish"):
+                service.exchange_code("authorization-code")
+
+        self.assertFalse(self.token_path.exists())
+
+    def test_authorized_requires_tokens_and_all_required_scopes(self):
+        service = TikTokPublisher()
+        token_patch, _state_patch = self._path_patches()
+        self.token_path.write_text(
+            json.dumps(
+                {
+                    "access_token": "access-token",
+                    "refresh_token": "refresh-token",
+                    "scope": "user.info.basic",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with token_patch:
+            self.assertFalse(service.is_authorized())
+
     @patch("app.services.tiktok_publisher.requests.put")
     @patch("app.services.tiktok_publisher.requests.post")
     @patch("app.services.tiktok_publisher.os.path.isfile", return_value=True)
@@ -168,6 +211,145 @@ class TestTikTokPublisher(unittest.TestCase):
         self.assertTrue(post_body["post_info"]["is_aigc"])
         self.assertEqual(put.call_args.kwargs["headers"]["Content-Range"], "bytes 0-3/4")
 
+    @patch("app.services.tiktok_publisher.requests.put")
+    @patch("app.services.tiktok_publisher.requests.post")
+    @patch("app.services.tiktok_publisher.os.path.isfile", return_value=True)
+    @patch("app.services.tiktok_publisher.os.path.getsize", return_value=4)
+    @patch("builtins.open", mock_open(read_data=b"data"))
+    @patch("app.services.tiktok_publisher.config.app")
+    def test_status_failure_after_upload_preserves_publish_id_for_recovery(
+        self, config_app, _getsize, _isfile, post, put
+    ):
+        config_app.get.side_effect = self.config.get
+        creator = MagicMock(ok=True, status_code=200)
+        creator.json.return_value = {
+            "data": {
+                "privacy_level_options": ["SELF_ONLY"],
+                "max_video_post_duration_sec": 180,
+            },
+            "error": {"code": "ok"},
+        }
+        initialized = MagicMock(ok=True, status_code=200)
+        initialized.json.return_value = {
+            "data": {
+                "publish_id": "publish-recoverable",
+                "upload_url": "https://open-upload.tiktokapis.com/upload/?id=secret",
+            },
+            "error": {"code": "ok"},
+        }
+        status_error = MagicMock(ok=False, status_code=503)
+        status_error.json.return_value = {
+            "error": {"code": "internal_error", "message": "try again"}
+        }
+        post.side_effect = [creator, initialized, status_error]
+        put.return_value = MagicMock(status_code=201)
+        service = TikTokPublisher()
+
+        with patch.object(service, "_get_access_token", return_value="access-token"):
+            result = service.publish_video(
+                "/video.mp4",
+                title="Title",
+                privacy_level="SELF_ONLY",
+                duration_seconds=30,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["status"], "processing")
+        self.assertEqual(result["publish_id"], "publish-recoverable")
+        self.assertEqual(result["processing_status"], "PROCESSING_UPLOAD")
+
+    def test_files_above_64_mb_are_split_into_multiple_valid_chunks(self):
+        mib = 1024 * 1024
+        for file_size in (64 * mib + 1, 100 * mib, 128 * mib - 1, 4 * 1024 * mib):
+            with self.subTest(file_size=file_size):
+                chunk_size, chunk_count = TikTokPublisher._chunk_plan(file_size)
+                final_size = file_size - (chunk_count - 1) * chunk_size
+                self.assertGreaterEqual(chunk_count, 2)
+                self.assertLessEqual(chunk_size, TikTokPublisher.MAX_CHUNK_SIZE)
+                self.assertGreaterEqual(chunk_size, TikTokPublisher.MIN_CHUNK_SIZE)
+                self.assertLessEqual(final_size, TikTokPublisher.MAX_FINAL_CHUNK_SIZE)
+
+    @patch("app.services.tiktok_publisher.time.sleep")
+    @patch("app.services.tiktok_publisher.requests.put")
+    @patch("builtins.open", mock_open(read_data=b"data"))
+    def test_upload_retries_temporary_server_errors(self, put, sleep):
+        put.side_effect = [
+            MagicMock(status_code=500),
+            MagicMock(status_code=503),
+            MagicMock(status_code=201),
+        ]
+        service = TikTokPublisher()
+
+        service._upload_file(
+            "/video.mp4",
+            "https://open-upload.tiktokapis.com/upload/?id=secret",
+            4,
+            4,
+            1,
+        )
+
+        self.assertEqual(put.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    @patch("app.services.tiktok_publisher.time.sleep")
+    @patch("app.services.tiktok_publisher.requests.put")
+    @patch("builtins.open", mock_open(read_data=b"data"))
+    def test_upload_retries_temporary_network_errors(self, put, sleep):
+        put.side_effect = [
+            requests.ConnectionError("temporary failure"),
+            MagicMock(status_code=201),
+        ]
+        service = TikTokPublisher()
+
+        service._upload_file(
+            "/video.mp4",
+            "https://open-upload.tiktokapis.com/upload/?id=secret",
+            4,
+            4,
+            1,
+        )
+
+        self.assertEqual(put.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    @patch("app.services.tiktok_publisher.os.path.isfile", return_value=True)
+    @patch("app.services.tiktok_publisher.os.path.getsize", return_value=4)
+    @patch("app.services.tiktok_publisher.config.app")
+    def test_network_failure_after_initialization_preserves_publish_id(
+        self, config_app, _getsize, _isfile
+    ):
+        config_app.get.side_effect = self.config.get
+        service = TikTokPublisher()
+        creator = {
+            "privacy_level_options": ["SELF_ONLY"],
+            "max_video_post_duration_sec": 180,
+        }
+        initialized = {
+            "publish_id": "publish-recoverable",
+            "upload_url": "https://open-upload.tiktokapis.com/upload/?id=secret",
+        }
+
+        with (
+            patch.object(service, "_get_access_token", return_value="access-token"),
+            patch.object(service, "_api_post", side_effect=[creator, initialized]),
+            patch.object(
+                service,
+                "_upload_file",
+                side_effect=requests.ConnectionError("temporary failure"),
+            ),
+        ):
+            result = service.publish_video(
+                "/video.mp4",
+                title="Title",
+                privacy_level="SELF_ONLY",
+                duration_seconds=30,
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["publish_id"], "publish-recoverable")
+        self.assertEqual(result["processing_status"], "UPLOAD_FAILED")
+        self.assertEqual(result["error"], "TikTok publishing failed (ConnectionError)")
+
     @patch("app.services.tiktok_publisher.requests.post")
     @patch("app.services.tiktok_publisher.os.path.isfile", return_value=True)
     @patch("app.services.tiktok_publisher.os.path.getsize", return_value=4)
@@ -197,6 +379,7 @@ class TestTikTokPublisher(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
 
     @patch("app.services.tiktok_publisher.logger.error")
+    @patch("app.services.tiktok_publisher.time.sleep")
     @patch("app.services.tiktok_publisher.requests.put")
     @patch("app.services.tiktok_publisher.requests.post")
     @patch("app.services.tiktok_publisher.os.path.isfile", return_value=True)
@@ -204,7 +387,7 @@ class TestTikTokPublisher(unittest.TestCase):
     @patch("builtins.open", mock_open(read_data=b"data"))
     @patch("app.services.tiktok_publisher.config.app")
     def test_upload_failure_does_not_expose_temporary_upload_url(
-        self, config_app, _getsize, _isfile, post, put, error_log
+        self, config_app, _getsize, _isfile, post, put, _sleep, error_log
     ):
         config_app.get.side_effect = self.config.get
         secret = "sensitive-upload-id"
@@ -238,6 +421,9 @@ class TestTikTokPublisher(unittest.TestCase):
 
         self.assertFalse(result["success"])
         self.assertEqual(result["error"], "TikTok video transfer failed (HTTP 500)")
+        self.assertEqual(result["publish_id"], "publish-123")
+        self.assertEqual(result["processing_status"], "UPLOAD_FAILED")
+        self.assertEqual(put.call_count, service.UPLOAD_RETRY_ATTEMPTS)
         self.assertNotIn(secret, result["error"])
         self.assertNotIn(secret, error_log.call_args.args[0])
 

@@ -40,6 +40,8 @@ class TikTokPublisher:
     MAX_VIDEO_SIZE = 4 * 1024 * 1024 * 1024
     STATUS_POLL_INTERVAL_SECONDS = 2
     STATUS_POLL_ATTEMPTS = 30
+    UPLOAD_RETRY_ATTEMPTS = 3
+    UPLOAD_RETRY_BASE_SECONDS = 1
 
     def __init__(self) -> None:
         self._pending_code_verifier = ""
@@ -84,7 +86,11 @@ class TikTokPublisher:
 
     def is_authorized(self) -> bool:
         token = self._load_token()
-        return bool(token.get("access_token") and token.get("refresh_token"))
+        return bool(
+            token.get("access_token")
+            and token.get("refresh_token")
+            and self._has_required_scopes(token)
+        )
 
     def is_configured(self) -> bool:
         return self.enabled and self.has_client_credentials() and self.is_authorized()
@@ -148,6 +154,7 @@ class TikTokPublisher:
         except requests.RequestException as exc:
             raise RuntimeError(self._request_failure("TikTok authorization", exc)) from None
         token = self._token_payload(response, "TikTok authorization")
+        self._require_scopes(token, "TikTok authorization")
         self._save_token(self._normalize_token(token))
         return {
             "success": True,
@@ -183,7 +190,11 @@ class TikTokPublisher:
     def account_summary(self) -> dict:
         token = self._load_token()
         return {
-            "authorized": bool(token.get("access_token") and token.get("refresh_token")),
+            "authorized": bool(
+                token.get("access_token")
+                and token.get("refresh_token")
+                and self._has_required_scopes(token)
+            ),
             "open_id": str(token.get("open_id") or ""),
             "scope": str(token.get("scope") or ""),
         }
@@ -217,6 +228,7 @@ class TikTokPublisher:
         if not os.path.isfile(video_path):
             return self._failure(f"Video file not found: {video_path}")
 
+        publish_id = ""
         try:
             file_size = os.path.getsize(video_path)
             self._validate_file_size(file_size)
@@ -290,7 +302,21 @@ class TikTokPublisher:
                 raise RuntimeError("TikTok did not return a publish ID and upload URL")
 
             self._upload_file(video_path, upload_url, file_size, chunk_size, chunk_count)
-            status = self._wait_for_status(publish_id, access_token)
+            try:
+                status = self._wait_for_status(publish_id, access_token)
+            except RuntimeError as exc:
+                logger.warning(
+                    f"TikTok upload completed, but status is temporarily unavailable: {exc}"
+                )
+                return {
+                    "success": True,
+                    "platform": "tiktok",
+                    "provider": "tiktok_direct",
+                    "status": "processing",
+                    "publish_id": publish_id,
+                    "processing_status": "PROCESSING_UPLOAD",
+                    "warning": str(exc),
+                }
             if status.get("status") == "FAILED":
                 return self._failure(
                     f"TikTok post failed: {status.get('fail_reason') or 'unknown reason'}",
@@ -299,9 +325,7 @@ class TikTokPublisher:
                 )
 
             processing_status = str(status.get("status") or "PROCESSING_UPLOAD")
-            logger.success(
-                f"TikTok upload accepted: publish_id={publish_id}, status={processing_status}"
-            )
+            logger.success(f"TikTok upload accepted: status={processing_status}")
             return {
                 "success": True,
                 "platform": "tiktok",
@@ -315,10 +339,20 @@ class TikTokPublisher:
         except requests.RequestException as exc:
             message = self._request_failure("TikTok publishing", exc)
             logger.error(message)
-            return self._failure(message)
+            extra = (
+                {"publish_id": publish_id, "processing_status": "UPLOAD_FAILED"}
+                if publish_id
+                else {}
+            )
+            return self._failure(message, **extra)
         except (OSError, ValueError, RuntimeError) as exc:
             logger.error(f"direct TikTok publishing failed: {exc}")
-            return self._failure(str(exc))
+            extra = (
+                {"publish_id": publish_id, "processing_status": "UPLOAD_FAILED"}
+                if publish_id
+                else {}
+            )
+            return self._failure(str(exc), **extra)
 
     def get_post_status(self, publish_id: str) -> dict:
         publish_id = str(publish_id or "").strip()
@@ -329,10 +363,13 @@ class TikTokPublisher:
     def _get_access_token(self) -> str:
         token = self._load_token()
         access_token = str(token.get("access_token") or "")
+        refresh_token = str(token.get("refresh_token") or "")
+        if not access_token and not refresh_token:
+            raise RuntimeError("TikTok account is not authorized")
+        self._require_scopes(token, "TikTok account")
         expires_at = float(token.get("expires_at") or 0)
         if access_token and expires_at > time.time() + 60:
             return access_token
-        refresh_token = str(token.get("refresh_token") or "")
         if not refresh_token:
             raise RuntimeError("TikTok account is not authorized")
 
@@ -350,6 +387,7 @@ class TikTokPublisher:
         except requests.RequestException as exc:
             raise RuntimeError(self._request_failure("TikTok token refresh", exc)) from None
         refreshed = self._token_payload(response, "TikTok token refresh")
+        self._require_scopes(refreshed, "TikTok token refresh")
         normalized = self._normalize_token(refreshed)
         self._save_token(normalized)
         return str(normalized["access_token"])
@@ -400,11 +438,11 @@ class TikTokPublisher:
             raise ValueError("TikTok video file is empty")
         if file_size <= cls.MAX_CHUNK_SIZE:
             return file_size, 1
-        chunk_size = cls.MAX_CHUNK_SIZE
-        chunk_count = max(1, file_size // chunk_size)
-        final_size = file_size - (chunk_count - 1) * chunk_size
-        if final_size > cls.MAX_FINAL_CHUNK_SIZE:
-            chunk_count += 1
+        # TikTok requires more than one chunk above 64 MB. Using half the file
+        # size until the regular 64 MB ceiling is reached also keeps the merged
+        # final chunk within the allowed 128 MB maximum.
+        chunk_size = min(cls.MAX_CHUNK_SIZE, file_size // 2)
+        chunk_count = file_size // chunk_size
         return chunk_size, chunk_count
 
     def _upload_file(
@@ -435,18 +473,30 @@ class TikTokPublisher:
                 if len(chunk) != current_size:
                     raise OSError("Could not read the complete TikTok video chunk")
                 end = offset + current_size - 1
-                response = requests.put(
-                    upload_url,
-                    headers={
-                        "Content-Type": mime_type,
-                        "Content-Length": str(current_size),
-                        "Content-Range": f"bytes {offset}-{end}/{file_size}",
-                    },
-                    data=chunk,
-                    timeout=600,
-                )
                 expected_status = 201 if index == chunk_count - 1 else 206
-                if response.status_code != expected_status:
+                for attempt in range(self.UPLOAD_RETRY_ATTEMPTS):
+                    try:
+                        response = requests.put(
+                            upload_url,
+                            headers={
+                                "Content-Type": mime_type,
+                                "Content-Length": str(current_size),
+                                "Content-Range": f"bytes {offset}-{end}/{file_size}",
+                            },
+                            data=chunk,
+                            timeout=600,
+                        )
+                    except requests.RequestException:
+                        if attempt + 1 < self.UPLOAD_RETRY_ATTEMPTS:
+                            time.sleep(self.UPLOAD_RETRY_BASE_SECONDS * (2**attempt))
+                            continue
+                        raise
+                    if response.status_code == expected_status:
+                        break
+                    retryable = 500 <= response.status_code < 600
+                    if retryable and attempt + 1 < self.UPLOAD_RETRY_ATTEMPTS:
+                        time.sleep(self.UPLOAD_RETRY_BASE_SECONDS * (2**attempt))
+                        continue
                     raise RuntimeError(
                         f"TikTok video transfer failed (HTTP {response.status_code})"
                     )
@@ -518,12 +568,37 @@ class TikTokPublisher:
         if file_size > cls.MAX_VIDEO_SIZE:
             raise ValueError("TikTok video exceeds the 4 GB upload limit")
 
+    @classmethod
+    def _has_required_scopes(cls, token: dict) -> bool:
+        granted = {
+            scope.strip()
+            for scope in str(token.get("scope") or "").replace(" ", ",").split(",")
+            if scope.strip()
+        }
+        return set(cls.REQUIRED_SCOPES).issubset(granted)
+
+    @classmethod
+    def _require_scopes(cls, token: dict, operation: str) -> None:
+        if cls._has_required_scopes(token):
+            return
+        granted = {
+            scope.strip()
+            for scope in str(token.get("scope") or "").replace(" ", ",").split(",")
+            if scope.strip()
+        }
+        missing = [scope for scope in cls.REQUIRED_SCOPES if scope not in granted]
+        raise RuntimeError(
+            f"{operation} is missing required scopes: {', '.join(missing)}"
+        )
+
     @staticmethod
     def _token_payload(response: requests.Response, operation: str) -> dict:
         try:
             payload = response.json()
         except ValueError:
             raise RuntimeError(f"{operation} returned an invalid response") from None
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{operation} returned an invalid response")
         if not response.ok or payload.get("error"):
             code = str(payload.get("error") or f"HTTP {response.status_code}")
             detail = str(payload.get("error_description") or "request rejected")

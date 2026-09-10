@@ -63,5 +63,6 @@ def configure_terminal_logger(sink, level: str, colorize: bool = True) -> int:
             level=level,
             format=format_log_record,
             colorize=colorize,
+            diagnose=False,
         )
         return _terminal_handler_id

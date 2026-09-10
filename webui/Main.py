@@ -1719,6 +1719,27 @@ def _save_tiktok_result(task_id, task, video_path, result):
     task["tiktok_direct_results"] = results
 
 
+def _refresh_tiktok_result(task_id, task, video_path, existing_result, service):
+    current = service.get_post_status(existing_result.get("publish_id", ""))
+    processing_status = str(current.get("status") or "PROCESSING_UPLOAD")
+    updated = {
+        **existing_result,
+        "success": processing_status != "FAILED",
+        "status": (
+            "published"
+            if processing_status == "PUBLISH_COMPLETE"
+            else "failed" if processing_status == "FAILED" else "processing"
+        ),
+        "processing_status": processing_status,
+    }
+    updated.pop("warning", None)
+    if processing_status == "FAILED":
+        updated["error"] = str(current.get("fail_reason") or "TikTok post failed")
+    else:
+        updated.pop("error", None)
+    _save_tiktok_result(task_id, task, video_path, updated)
+
+
 def _render_tiktok_publish_panel(task_id, task, video_files):
     """Require a per-video review and explicit consent before TikTok upload."""
     service = tiktok_publisher.tiktok_publisher
@@ -1752,45 +1773,39 @@ def _render_tiktok_publish_panel(task_id, task, video_files):
                             "O TikTok confirmou a postagem privada.",
                         )
                     )
-                elif existing_result.get("success"):
-                    st.info(
-                        _publishing_text(
-                            f"TikTok is processing this post ({status or 'PROCESSING_UPLOAD'}).",
-                            f"O TikTok está processando esta postagem ({status or 'PROCESSING_UPLOAD'}).",
+                    continue
+
+                publish_id = str(existing_result.get("publish_id") or "")
+                operation_active = bool(publish_id and status != "FAILED")
+                if operation_active:
+                    if existing_result.get("success"):
+                        st.info(
+                            _publishing_text(
+                                f"TikTok is processing this post ({status or 'PROCESSING_UPLOAD'}).",
+                                f"O TikTok está processando esta postagem ({status or 'PROCESSING_UPLOAD'}).",
+                            )
                         )
-                    )
+                    else:
+                        st.warning(
+                            _publishing_text(
+                                "The transfer was interrupted, but TikTok still has an active publishing operation. Check its status before trying again.",
+                                "A transferência foi interrompida, mas o TikTok ainda possui uma operação ativa. Consulte o status antes de tentar novamente.",
+                            )
+                        )
+                    if existing_result.get("warning"):
+                        st.caption(str(existing_result["warning"]))
                     if st.button(
                         _publishing_text("Refresh TikTok status", "Atualizar status do TikTok"),
                         key=f"{panel_key}_refresh_status",
                         use_container_width=True,
                     ):
                         try:
-                            current = service.get_post_status(
-                                existing_result.get("publish_id", "")
-                            )
-                            processing_status = str(
-                                current.get("status") or "PROCESSING_UPLOAD"
-                            )
-                            updated = {
-                                **existing_result,
-                                "success": processing_status != "FAILED",
-                                "status": (
-                                    "published"
-                                    if processing_status == "PUBLISH_COMPLETE"
-                                    else (
-                                        "failed"
-                                        if processing_status == "FAILED"
-                                        else "processing"
-                                    )
-                                ),
-                                "processing_status": processing_status,
-                            }
-                            if processing_status == "FAILED":
-                                updated["error"] = str(
-                                    current.get("fail_reason") or "TikTok post failed"
-                                )
-                            _save_tiktok_result(
-                                task_id, task, video_path, updated
+                            _refresh_tiktok_result(
+                                task_id,
+                                task,
+                                video_path,
+                                existing_result,
+                                service,
                             )
                         except Exception as exc:
                             logger.error(
@@ -1799,11 +1814,20 @@ def _render_tiktok_publish_panel(task_id, task, video_files):
                             st.error(str(exc))
                         else:
                             st.rerun(scope="app")
-                else:
+                    continue
+
+                if not existing_result.get("success"):
                     st.error(
                         _publishing_text(
                             f"TikTok publishing failed: {existing_result.get('error') or 'unknown error'}",
                             f"A publicação no TikTok falhou: {existing_result.get('error') or 'erro desconhecido'}",
+                        )
+                    )
+                elif status:
+                    st.info(
+                        _publishing_text(
+                            f"TikTok status: {status}",
+                            f"Status do TikTok: {status}",
                         )
                     )
 
@@ -1923,18 +1947,47 @@ def _render_tiktok_publish_panel(task_id, task, video_files):
                     value=False,
                     key=f"{panel_key}_own_brand",
                 )
+                brand_content_key = f"{panel_key}_branded_content"
+                if privacy == service.TEST_PRIVACY_LEVEL:
+                    st.session_state.pop(brand_content_key, None)
                 brand_content = st.checkbox(
                     _publishing_text("Third-party brand", "Marca de terceiros"),
                     value=False,
                     disabled=privacy == service.TEST_PRIVACY_LEVEL,
-                    key=f"{panel_key}_branded_content",
+                    key=brand_content_key,
+                )
+                brand_content = bool(
+                    brand_content and privacy != service.TEST_PRIVACY_LEVEL
                 )
 
-            music_consent = st.checkbox(
+                if brand_content:
+                    st.info(
+                        _publishing_text(
+                            "Your video will be labeled as Paid partnership.",
+                            "Seu vídeo será identificado como Parceria paga.",
+                        )
+                    )
+                elif brand_organic:
+                    st.info(
+                        _publishing_text(
+                            "Your video will be labeled as Promotional content.",
+                            "Seu vídeo será identificado como Conteúdo promocional.",
+                        )
+                    )
+
+            consent_text = (
                 _publishing_text(
-                    "I confirm that I agree to TikTok's Music Usage Confirmation",
-                    "Confirmo que concordo com a Confirmação de Uso de Música do TikTok",
-                ),
+                    "By posting, I agree to TikTok's Branded Content Policy and Music Usage Confirmation",
+                    "Ao publicar, concordo com a Política de Conteúdo de Marca e a Confirmação de Uso de Música do TikTok",
+                )
+                if brand_content
+                else _publishing_text(
+                    "By posting, I agree to TikTok's Music Usage Confirmation",
+                    "Ao publicar, concordo com a Confirmação de Uso de Música do TikTok",
+                )
+            )
+            music_consent = st.checkbox(
+                consent_text,
                 value=False,
                 key=f"{panel_key}_music_consent",
             )
@@ -1942,6 +1995,12 @@ def _render_tiktok_publish_panel(task_id, task, video_files):
                 _publishing_text(
                     "Do not upload videos with promotional watermarks or branding from another platform.",
                     "Não envie vídeos com marca d'água promocional ou identificação de outra plataforma.",
+                )
+            )
+            st.caption(
+                _publishing_text(
+                    "After publishing, TikTok may take a few minutes to process and display the video.",
+                    "Depois da publicação, o TikTok pode levar alguns minutos para processar e exibir o vídeo.",
                 )
             )
 

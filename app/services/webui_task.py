@@ -76,6 +76,7 @@ def _run_generation(
                 level="DEBUG",
                 format=format_log_record,
                 colorize=False,
+                diagnose=False,
                 filter=lambda record: record["thread"].id == worker_thread_id,
             )
 
@@ -191,6 +192,7 @@ def _run_final_render(
                 level="DEBUG",
                 format=format_log_record,
                 colorize=False,
+                diagnose=False,
                 filter=lambda record: record["thread"].id == worker_thread_id,
             )
 
@@ -281,4 +283,3 @@ def submit_draft_final_render(
         params=task_params,
         capture_logs=capture_logs,
     )
-
