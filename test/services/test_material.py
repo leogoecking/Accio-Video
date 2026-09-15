@@ -59,7 +59,9 @@ class TestMaterialTlsVerification(unittest.TestCase):
             }
         )
 
-        with patch("app.services.material.requests.get", return_value=fake_response) as get:
+        with patch(
+            "app.services.material.requests.get", return_value=fake_response
+        ) as get:
             results = material.search_videos_pexels("cat", minimum_duration=1)
 
         self.assertEqual(len(results), 1)
@@ -101,10 +103,12 @@ class TestMaterialTlsVerification(unittest.TestCase):
                         },
                     }
                 ]
-            }
+            },
         )
 
-        with patch("app.services.material.requests.get", return_value=fake_response) as get:
+        with patch(
+            "app.services.material.requests.get", return_value=fake_response
+        ) as get:
             results = material.search_videos_pixabay(
                 "cat",
                 minimum_duration=1,
@@ -113,6 +117,41 @@ class TestMaterialTlsVerification(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertFalse(get.call_args.kwargs["verify"])
+
+    def test_search_pixabay_chooses_best_rendition_and_keeps_tags(self):
+        config.app["pixabay_api_keys"] = ["pixabay-key"]
+        response = SimpleNamespace(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            text="",
+            json=lambda: {
+                "hits": [
+                    {
+                        "id": 42,
+                        "duration": 8,
+                        "tags": "forest, river",
+                        "videos": {
+                            "small": {
+                                "width": 720,
+                                "height": 1280,
+                                "url": "https://example.com/small.mp4",
+                            },
+                            "large": {
+                                "width": 1080,
+                                "height": 1920,
+                                "url": "https://example.com/large.mp4",
+                            },
+                        },
+                    }
+                ]
+            },
+        )
+
+        with patch("app.services.material.requests.get", return_value=response):
+            results = material.search_videos_pixabay("forest", 5)
+
+        self.assertEqual(results[0].url, "https://example.com/large.mp4")
+        self.assertEqual(results[0].source_info["keywords"], ["forest", "river"])
 
     def test_remote_searches_only_return_requested_orientation(self):
         """
@@ -194,18 +233,14 @@ class TestMaterialTlsVerification(unittest.TestCase):
                         "duration": 8,
                         "max_width": 1920,
                         "max_height": 1080,
-                        "urls": {
-                            "mp4_download": "https://example.com/landscape.mp4"
-                        },
+                        "urls": {"mp4_download": "https://example.com/landscape.mp4"},
                     },
                     {
                         "id": "portrait",
                         "duration": 8,
                         "max_width": 1080,
                         "max_height": 1920,
-                        "urls": {
-                            "mp4_download": "https://example.com/portrait.mp4"
-                        },
+                        "urls": {"mp4_download": "https://example.com/portrait.mp4"},
                     },
                     {
                         "id": "unknown",
@@ -314,10 +349,13 @@ class TestMaterialTlsVerification(unittest.TestCase):
         )
 
         for aspect, expected_filter in cases:
-            with self.subTest(aspect=aspect), patch(
-                "app.services.material.requests.get",
-                return_value=fake_response,
-            ) as get:
+            with (
+                self.subTest(aspect=aspect),
+                patch(
+                    "app.services.material.requests.get",
+                    return_value=fake_response,
+                ) as get,
+            ):
                 material.search_videos_coverr(
                     "city",
                     minimum_duration=1,
@@ -414,9 +452,10 @@ class TestMaterialTlsVerification(unittest.TestCase):
             json=lambda: {"hits": []},
         )
 
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ), patch("app.services.material.logger.info") as log:
+        with (
+            patch("app.services.material.requests.get", return_value=fake_response),
+            patch("app.services.material.logger.info") as log,
+        ):
             material.search_videos_pixabay("cat", minimum_duration=1)
 
         logged_messages = " ".join(str(call.args[0]) for call in log.call_args_list)
@@ -440,9 +479,10 @@ class TestMaterialTlsVerification(unittest.TestCase):
             text="<html><title>Just a moment...</title></html>",
         )
 
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ), patch("app.services.material.logger.error") as log:
+        with (
+            patch("app.services.material.requests.get", return_value=fake_response),
+            patch("app.services.material.logger.error") as log,
+        ):
             results = material.search_videos_pixabay("nature", minimum_duration=1)
 
         logged_messages = " ".join(str(call.args[0]) for call in log.call_args_list)
@@ -469,9 +509,10 @@ class TestMaterialTlsVerification(unittest.TestCase):
             text="API rate limit exceeded",
         )
 
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ), patch("app.services.material.logger.error") as log:
+        with (
+            patch("app.services.material.requests.get", return_value=fake_response),
+            patch("app.services.material.logger.error") as log,
+        ):
             results = material.search_videos_pixabay("nature", minimum_duration=1)
 
         logged_messages = " ".join(str(call.args[0]) for call in log.call_args_list)
@@ -497,9 +538,10 @@ class TestMaterialTlsVerification(unittest.TestCase):
             json=raise_invalid_json,
         )
 
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ), patch("app.services.material.logger.error") as log:
+        with (
+            patch("app.services.material.requests.get", return_value=fake_response),
+            patch("app.services.material.logger.error") as log,
+        ):
             results = material.search_videos_pixabay("nature", minimum_duration=1)
 
         logged_messages = " ".join(str(call.args[0]) for call in log.call_args_list)
@@ -516,13 +558,13 @@ class TestMaterialTlsVerification(unittest.TestCase):
         config.app["pixabay_api_keys"] = [api_key]
         config.proxy.clear()
         error = requests.ConnectionError(
-            "request failed for "
-            f"https://pixabay.com/api/videos/?q=nature&key={api_key}"
+            f"request failed for https://pixabay.com/api/videos/?q=nature&key={api_key}"
         )
 
-        with patch(
-            "app.services.material.requests.get", side_effect=error
-        ), patch("app.services.material.logger.error") as log:
+        with (
+            patch("app.services.material.requests.get", side_effect=error),
+            patch("app.services.material.logger.error") as log,
+        ):
             results = material.search_videos_pixabay("nature", minimum_duration=1)
 
         logged_messages = " ".join(str(call.args[0]) for call in log.call_args_list)
@@ -544,9 +586,10 @@ class TestMaterialTlsVerification(unittest.TestCase):
             f"failed to connect to proxy {proxy_url}"
         )
 
-        with patch(
-            "app.services.material.requests.get", side_effect=error
-        ), patch("app.services.material.logger.error") as log:
+        with (
+            patch("app.services.material.requests.get", side_effect=error),
+            patch("app.services.material.logger.error") as log,
+        ):
             results = material.search_videos_pixabay("nature", minimum_duration=1)
 
         logged_messages = " ".join(str(call.args[0]) for call in log.call_args_list)
@@ -572,9 +615,12 @@ class TestMaterialTlsVerification(unittest.TestCase):
                 return None
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            with patch(
-                "app.services.material.requests.get", return_value=fake_response
-            ) as get, patch("app.services.material.VideoFileClip", FakeVideoFileClip):
+            with (
+                patch(
+                    "app.services.material.requests.get", return_value=fake_response
+                ) as get,
+                patch("app.services.material.VideoFileClip", FakeVideoFileClip),
+            ):
                 video_path = material.save_video(
                     "https://example.com/video.mp4?token=abc", save_dir=temp_dir
                 )
@@ -791,6 +837,209 @@ class TestMaterialTlsVerification(unittest.TestCase):
         self.assertEqual(result, ["/tmp/a1.mp4"])
         self.assertTrue(warning.called)
 
+    def test_stock_selection_ranks_relevance_and_rotates_search_terms(self):
+        def candidate(asset_id, keyword, width=1080, height=1920):
+            return material.MaterialInfo(
+                provider="pexels",
+                url=f"https://v.example/{asset_id}.mp4",
+                duration=10,
+                source_info={
+                    "asset_id": asset_id,
+                    "keywords": [keyword],
+                    "rendition": {"width": width, "height": height},
+                },
+            )
+
+        results = {
+            "coffee": [
+                candidate("unrelated", "mountain", 2160, 3840),
+                candidate("coffee", "coffee", 720, 1280),
+            ],
+            "office": [
+                candidate("coffee", "office"),  # Same asset from another search.
+                candidate("office", "office"),
+            ],
+        }
+        downloaded_urls = []
+
+        def fake_save_video(video_url, save_dir=""):
+            downloaded_urls.append(video_url)
+            return f"/tmp/{video_url.rsplit('/', 1)[-1]}"
+
+        with (
+            patch.dict(config.app, {"material_directory": ""}),
+            patch.object(
+                material,
+                "search_videos_pexels",
+                side_effect=lambda search_term, **_: results[search_term],
+            ),
+            patch.object(material, "save_video", side_effect=fake_save_video),
+            patch.object(material.ai_image, "generate_ai_video_clip") as ai_fallback,
+            patch.object(
+                material.material_cache, "load_material_search_cache", return_value=None
+            ),
+            patch.object(material.material_cache, "save_material_search_cache"),
+            patch.object(
+                material.task_artifacts, "patch_script_data", return_value=True
+            ),
+        ):
+            paths = material.download_videos(
+                task_id="ranked-materials",
+                search_terms=["coffee", "office"],
+                audio_duration=11,
+                max_clip_duration=5,
+            )
+
+        self.assertEqual(
+            downloaded_urls,
+            [
+                "https://v.example/coffee.mp4",
+                "https://v.example/office.mp4",
+                "https://v.example/unrelated.mp4",
+            ],
+        )
+        self.assertEqual(len(paths), 3)
+        ai_fallback.assert_not_called()
+
+    def test_material_rank_preserves_model_numbers_and_title_punctuation(self):
+        self.assertEqual(
+            material.material_cache.public_material_keywords("iPhone 17 by the sea?"),
+            ["iphone", "17", "by", "the", "sea"],
+        )
+        candidates = [
+            material.MaterialInfo(
+                url="https://example.test/16.mp4",
+                duration=10,
+                source_info={
+                    "keywords": ["iPhone 16"],
+                    "rendition": {"width": 1080, "height": 1920},
+                },
+            ),
+            material.MaterialInfo(
+                url="https://example.test/17.mp4",
+                duration=10,
+                source_info={
+                    "keywords": ["iPhone 17"],
+                    "rendition": {"width": 720, "height": 1280},
+                },
+            ),
+        ]
+        ranked = material._rank_materials(
+            candidates, "iPhone 17", material.VideoAspect.portrait, 5
+        )
+        self.assertEqual(ranked[0].url, "https://example.test/17.mp4")
+
+    def test_shared_asset_is_assigned_to_scarce_script_term(self):
+        def candidate(asset_id, term):
+            return material.MaterialInfo(
+                provider="pexels",
+                url=f"https://v.example/{asset_id}.mp4",
+                duration=5,
+                source_info={
+                    "asset_id": asset_id,
+                    "search_term": term,
+                    "rendition": {"width": 1080, "height": 1920},
+                },
+            )
+
+        results = {
+            "opening": [
+                candidate("shared", "opening"),
+                candidate("opening", "opening"),
+            ],
+            "ending": [candidate("shared", "ending")],
+        }
+        saved_urls = []
+        with (
+            patch.object(
+                material,
+                "save_video",
+                side_effect=lambda video_url, save_dir="": (
+                    saved_urls.append(video_url) or video_url
+                ),
+            ),
+            patch.object(material.ai_image, "generate_ai_video_clip") as ai_fallback,
+            patch.object(material, "_persist_material_sources"),
+        ):
+            material._download_videos_by_script_order(
+                "review",
+                ["opening", "ending"],
+                lambda search_term, **_: results[search_term],
+                material.VideoAspect.portrait,
+                8,
+                5,
+                "",
+            )
+
+        self.assertEqual(
+            saved_urls,
+            ["https://v.example/opening.mp4", "https://v.example/shared.mp4"],
+        )
+        ai_fallback.assert_not_called()
+
+    def test_shared_only_asset_keeps_both_script_scenes(self):
+        item = material.MaterialInfo(
+            provider="pexels",
+            url="https://v.example/shared.mp4",
+            duration=5,
+            source_info={"asset_id": "shared"},
+        )
+        with (
+            patch.object(
+                material, "save_video", return_value="/tmp/shared.mp4"
+            ) as save,
+            patch.object(material.ai_image, "generate_ai_video_clip") as ai_fallback,
+            patch.object(material, "_persist_material_sources"),
+        ):
+            paths = material._download_videos_by_script_order(
+                "review",
+                ["opening", "ending"],
+                lambda **_: [item],
+                material.VideoAspect.portrait,
+                8,
+                5,
+                "",
+            )
+        self.assertEqual(paths, ["/tmp/shared.mp4", "/tmp/shared.mp4"])
+        self.assertEqual(save.call_count, 2)
+        ai_fallback.assert_not_called()
+
+    def test_random_mode_varies_near_equal_stock_materials_across_tasks(self):
+        candidates = [
+            material.MaterialInfo(
+                provider="pexels",
+                url=f"https://v.example/{index}.mp4",
+                duration=10,
+                source_info={
+                    "asset_id": str(index),
+                    "rendition": {"width": 1080, "height": 1920},
+                },
+            )
+            for index in range(5)
+        ]
+        selected = set()
+        with (
+            patch.object(
+                material, "_search_videos_with_cache", return_value=candidates
+            ),
+            patch.object(
+                material,
+                "save_video",
+                side_effect=lambda video_url, save_dir="": video_url,
+            ),
+            patch.object(material, "_persist_material_sources"),
+        ):
+            for index in range(8):
+                paths = material.download_videos(
+                    f"task-{index}",
+                    ["topic"],
+                    audio_duration=8,
+                    max_clip_duration=5,
+                    video_concat_mode="random",
+                )
+                selected.add(tuple(paths))
+        self.assertGreater(len(selected), 1)
+
 
 class TestCoverrProvider(unittest.TestCase):
     """
@@ -941,9 +1190,7 @@ class TestCoverrProvider(unittest.TestCase):
             }
         )
 
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ):
+        with patch("app.services.material.requests.get", return_value=fake_response):
             results = material.search_videos_coverr("x", minimum_duration=5)
 
         self.assertEqual(len(results), 1)
@@ -979,9 +1226,7 @@ class TestCoverrProvider(unittest.TestCase):
             }
         )
 
-        with patch(
-            "app.services.material.requests.get", return_value=fake_response
-        ):
+        with patch("app.services.material.requests.get", return_value=fake_response):
             results = material.search_videos_coverr("x", minimum_duration=1)
 
         self.assertEqual(len(results), 1)
@@ -998,9 +1243,7 @@ class TestCoverrProvider(unittest.TestCase):
 
         # Subtest A: malformed response (no "hits" key)
         with self.subTest("malformed response"):
-            fake_response = SimpleNamespace(
-                json=lambda: {"error": "rate limited"}
-            )
+            fake_response = SimpleNamespace(json=lambda: {"error": "rate limited"})
             with patch(
                 "app.services.material.requests.get", return_value=fake_response
             ):
@@ -1036,17 +1279,22 @@ class TestCoverrProvider(unittest.TestCase):
         fake_item.url = "https://storage.coverr.co/videos/abc/download?token=xyz"
         fake_item.duration = 10
 
-        with patch(
-            "app.services.material.search_videos_coverr",
-            return_value=[fake_item],
-        ) as search, patch(
-            "app.services.material.save_video",
-            return_value="/tmp/coverr-saved.mp4",
-        ) as save, patch(
-            "app.services.material.material_cache.load_material_search_cache",
-            return_value=None,
-        ), patch(
-            "app.services.material.material_cache.save_material_search_cache",
+        with (
+            patch(
+                "app.services.material.search_videos_coverr",
+                return_value=[fake_item],
+            ) as search,
+            patch(
+                "app.services.material.save_video",
+                return_value="/tmp/coverr-saved.mp4",
+            ) as save,
+            patch(
+                "app.services.material.material_cache.load_material_search_cache",
+                return_value=None,
+            ),
+            patch(
+                "app.services.material.material_cache.save_material_search_cache",
+            ),
         ):
             result = material.download_videos(
                 task_id="t-coverr",
@@ -1196,7 +1444,9 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
     def test_generate_wavespeed_returns_empty_on_failed_prediction(self):
         """failed/cancelled/timeout 都按空结果返回,让上层跳过该关键词继续。"""
-        submit_response = self._json_response({"code": 200, "data": {"id": "pred-fail"}})
+        submit_response = self._json_response(
+            {"code": 200, "data": {"id": "pred-fail"}}
+        )
         poll_response = self._json_response(
             {
                 "code": 200,
@@ -1218,7 +1468,9 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
     def test_generate_wavespeed_returns_empty_on_rejected_submission(self):
         """非 200 envelope(如 key 无效)不能进入轮询,直接返回空结果。"""
-        submit_response = self._json_response({"code": 401, "message": "invalid api key"})
+        submit_response = self._json_response(
+            {"code": 401, "message": "invalid api key"}
+        )
 
         with (
             patch("app.services.material.requests.post", return_value=submit_response),
@@ -1569,7 +1821,9 @@ class TestWaveSpeedProvider(unittest.TestCase):
             ) as generate,
             patch(
                 "app.services.material.save_video",
-                side_effect=lambda video_url, save_dir="": f"/tmp/{video_url.rsplit('/', 1)[-1]}",
+                side_effect=lambda video_url, save_dir="": (
+                    f"/tmp/{video_url.rsplit('/', 1)[-1]}"
+                ),
             ),
         ):
             result = material.download_videos(
@@ -1609,7 +1863,9 @@ class TestWaveSpeedProvider(unittest.TestCase):
             ) as generate,
             patch(
                 "app.services.material.save_video",
-                side_effect=lambda video_url, save_dir="": f"/tmp/{video_url.rsplit('/', 1)[-1]}",
+                side_effect=lambda video_url, save_dir="": (
+                    f"/tmp/{video_url.rsplit('/', 1)[-1]}"
+                ),
             ),
         ):
             result = material.download_videos(
@@ -1667,9 +1923,24 @@ class TestWaveSpeedProvider(unittest.TestCase):
                         "id": 100,
                         "duration": 10,
                         "video_files": [
-                            {"id": 1, "width": 720, "height": 1280, "link": "https://cdn.example.com/720p.mp4"},
-                            {"id": 2, "width": 2160, "height": 3840, "link": "https://cdn.example.com/4k.mp4"},
-                            {"id": 3, "width": 1080, "height": 1920, "link": "https://cdn.example.com/1080p.mp4"},
+                            {
+                                "id": 1,
+                                "width": 720,
+                                "height": 1280,
+                                "link": "https://cdn.example.com/720p.mp4",
+                            },
+                            {
+                                "id": 2,
+                                "width": 2160,
+                                "height": 3840,
+                                "link": "https://cdn.example.com/4k.mp4",
+                            },
+                            {
+                                "id": 3,
+                                "width": 1080,
+                                "height": 1920,
+                                "link": "https://cdn.example.com/1080p.mp4",
+                            },
                         ],
                     }
                 ]
@@ -1724,4 +1995,3 @@ class TestWaveSpeedProvider(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

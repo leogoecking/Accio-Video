@@ -442,3 +442,135 @@ def test_script_order_constraint_does_not_replace_saved_concat_preference():
         assert _widget_by_key(
             unconstrained_session.selectbox, "video_concat_mode_select"
         ).value == "random"
+
+
+def test_keyword_button_requests_more_visual_concepts_for_long_script():
+    test_app_config = dict(
+        config.app,
+        video_source="pexels",
+        match_materials_to_script=True,
+        script_generation_backend="local",
+    )
+    test_ui_config = dict(
+        config.ui,
+        language="en",
+        voice_mode="tts",
+        tts_server="azure-tts-v1",
+        voice_name="en-US-JennyNeural-Female",
+        video_clip_duration=3,
+    )
+    terms = [f"distinct visual {index}" for index in range(14)]
+
+    with (
+        patch.object(config, "app", test_app_config),
+        patch.object(config, "ui", test_ui_config),
+        patch.object(config, "try_save_config", return_value=True),
+        patch.object(
+            voice,
+            "get_all_azure_voices",
+            return_value=["en-US-JennyNeural-Female"],
+        ),
+        patch("app.services.llm.generate_terms", return_value=terms) as generate,
+    ):
+        app = _new_app()
+        _widget_by_key(app.text_area, "video_subject").set_value("Science")
+        next(item for item in app.text_area if item.key == "video_script").set_value(
+            " ".join(["word"] * 194)
+        )
+        _widget_by_key(app.selectbox, "video_clip_duration_select").set_value(3)
+        app.run()
+        assert len(app.session_state["video_script"].split()) == 194
+        _widget_by_key(app.button, "auto_generate_terms").click()
+        app.run()
+        assert [str(item.value) for item in app.exception] == []
+
+        assert generate.call_count == 1
+        assert generate.call_args.kwargs["amount"] == 14
+        assert app.session_state["video_terms"] == ", ".join(terms)
+
+
+def test_combined_script_button_uses_recommended_keyword_count():
+    test_app_config = dict(
+        config.app,
+        video_source="pexels",
+        match_materials_to_script=True,
+        script_generation_backend="local",
+    )
+    test_ui_config = dict(
+        config.ui,
+        language="en",
+        voice_mode="tts",
+        tts_server="azure-tts-v1",
+        voice_name="en-US-JennyNeural-Female",
+        video_clip_duration=3,
+    )
+    script = " ".join(["word"] * 194)
+    terms = [f"distinct visual {index}" for index in range(14)]
+
+    with (
+        patch.object(config, "app", test_app_config),
+        patch.object(config, "ui", test_ui_config),
+        patch.object(config, "try_save_config", return_value=True),
+        patch.object(
+            voice,
+            "get_all_azure_voices",
+            return_value=["en-US-JennyNeural-Female"],
+        ),
+        patch("app.services.llm.generate_script", return_value=script),
+        patch("app.services.llm.generate_terms", return_value=terms) as generate,
+    ):
+        app = _new_app()
+        next(item for item in app.text_area if item.key == "video_subject").set_value(
+            "Science"
+        )
+        _widget_by_key(app.selectbox, "video_clip_duration_select").set_value(3)
+        app.run()
+        _widget_by_key(app.button, "auto_generate_script").click()
+        app.run()
+
+        assert [str(item.value) for item in app.exception] == []
+        assert generate.call_count == 1
+        assert generate.call_args.kwargs["amount"] == 14
+        assert generate.call_args.kwargs["match_script_order"] is True
+        assert app.session_state["video_terms"] == ", ".join(terms)
+
+
+def test_combined_script_button_keeps_script_when_keywords_fail():
+    test_app_config = dict(
+        config.app,
+        video_source="pexels",
+        match_materials_to_script=True,
+        script_generation_backend="local",
+    )
+    test_ui_config = dict(
+        config.ui,
+        language="en",
+        voice_mode="tts",
+        tts_server="azure-tts-v1",
+        voice_name="en-US-JennyNeural-Female",
+    )
+    script = "A generated science story."
+
+    with (
+        patch.object(config, "app", test_app_config),
+        patch.object(config, "ui", test_ui_config),
+        patch.object(config, "try_save_config", return_value=True),
+        patch.object(
+            voice,
+            "get_all_azure_voices",
+            return_value=["en-US-JennyNeural-Female"],
+        ),
+        patch("app.services.llm.generate_script", return_value=script),
+        patch("app.services.llm.generate_terms", return_value=[]),
+    ):
+        app = _new_app()
+        next(item for item in app.text_area if item.key == "video_subject").set_value(
+            "Science"
+        )
+        app.run()
+        _widget_by_key(app.button, "auto_generate_script").click()
+        app.run()
+
+        assert [str(item.value) for item in app.exception] == []
+        assert app.session_state["video_script"] == script
+        assert app.session_state["video_terms"] == ""

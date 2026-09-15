@@ -180,6 +180,7 @@ class TestScriptPromptOptions(unittest.TestCase):
         self.assertEqual(result, ["opening city", "middle office", "final sunset"])
         self.assertIn("chronological stock-video search terms", captured["prompt"])
         self.assertIn("same order as the script narration", captured["prompt"])
+        self.assertIn("exactly 3 distinct search terms", captured["prompt"])
 
     def test_generate_terms_returns_empty_list_on_provider_error(self):
         """
@@ -200,6 +201,53 @@ class TestScriptPromptOptions(unittest.TestCase):
 
         self.assertEqual(result, [])
         self.assertIsInstance(result, list)
+
+    def test_generate_terms_retries_incomplete_and_duplicate_results(self):
+        responses = [
+            '["opening city"]',
+            '["opening city", "OPENING CITY", "final sunset"]',
+            '["opening city", "middle office", "final sunset", "extra scene"]',
+        ]
+        with patch.object(
+            llm, "_generate_response", side_effect=responses
+        ) as generate:
+            result = llm.generate_terms(
+                video_subject="startup story",
+                video_script="First city. Then office. Finally sunset.",
+                amount=3,
+                match_script_order=True,
+            )
+
+        self.assertEqual(result, ["opening city", "middle office", "final sunset"])
+        self.assertEqual(generate.call_count, 3)
+
+    def test_generate_terms_rejects_persistently_short_results(self):
+        with (
+            patch.object(llm, "_max_retries", 2),
+            patch.object(
+                llm, "_generate_response", return_value='["opening city"]'
+            ) as generate,
+        ):
+            result = llm.generate_terms(
+                video_subject="startup story",
+                video_script="First city. Then office. Finally sunset.",
+                amount=3,
+                match_script_order=True,
+            )
+
+        self.assertEqual(result, [])
+        self.assertEqual(generate.call_count, 2)
+
+    def test_generate_terms_uses_default_count_when_optional_amount_is_none(self):
+        terms = [f"visual scene {index}" for index in range(5)]
+        with patch.object(llm, "_generate_response", return_value=json.dumps(terms)):
+            result = llm.generate_terms(
+                video_subject="startup story",
+                video_script="A short startup story.",
+                amount=None,
+            )
+
+        self.assertEqual(result, terms)
 
     def test_video_script_request_rejects_invalid_advanced_options(self):
         """

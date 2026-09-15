@@ -26,6 +26,25 @@ class TestSocialPublishing(unittest.TestCase):
         self.assertEqual(len(caption), 2200)
         self.assertTrue(caption.endswith("#energia #economia"))
 
+    def test_youtube_description_preserves_hashtags_within_utf8_byte_limit(self):
+        description = social_publishing.compose_caption(
+            {"caption": "á" * 3000, "hashtags": ["#energia", "#shorts"]},
+            max_length=5000,
+            max_bytes=5000,
+        )
+
+        self.assertLessEqual(len(description.encode("utf-8")), 5000)
+        self.assertTrue(description.endswith("\n\n#energia #shorts"))
+
+    def test_youtube_description_does_not_duplicate_existing_hashtags(self):
+        description = social_publishing.compose_caption(
+            {"caption": "Dicas #Shorts", "hashtags": ["#shorts", "#energia"]},
+            max_length=5000,
+            max_bytes=5000,
+        )
+
+        self.assertEqual(description, "Dicas #Shorts\n\n#energia")
+
     @patch("app.services.social_publishing.config.app")
     def test_configured_platforms_normalizes_and_deduplicates(self, config_app):
         config_app.get.return_value = ["YouTube", "instagram", "youtube", "unknown"]
@@ -62,12 +81,48 @@ class TestSocialPublishing(unittest.TestCase):
         youtube_upload.assert_called_once_with(
             "video.mp4",
             title="Title",
-            description="Description",
+            description="Description\n\n#shorts",
             tags=["#shorts"],
             privacy_status="private",
             contains_synthetic_media=True,
         )
         fallback.assert_not_called()
+
+    @patch.object(
+        type(social_publishing.youtube_publisher),
+        "enabled",
+        new_callable=PropertyMock,
+        return_value=False,
+    )
+    @patch.object(social_publishing.upload_post, "cross_post_video")
+    def test_upload_post_youtube_receives_hashtags_in_description(
+        self, fallback, _enabled
+    ):
+        fallback.return_value = {"success": True}
+
+        social_publishing.publish_video(
+            platform="youtube",
+            video_path="video.mp4",
+            metadata={
+                "title": "Energy",
+                "caption": "Reduce your energy bill.",
+                "hashtags": ["#energy", "#saving"],
+            },
+            youtube_privacy_status="private",
+        )
+
+        fallback.assert_called_once_with(
+            video_path="video.mp4",
+            title="Reduce your energy bill.",
+            platforms=["youtube"],
+            youtube_extra={
+                "youtube_title": "Energy",
+                "youtube_description": "Reduce your energy bill.\n\n#energy #saving",
+                "tags": ["#energy", "#saving"],
+                "privacyStatus": "private",
+                "containsSyntheticMedia": True,
+            },
+        )
 
     @patch.object(
         type(social_publishing.instagram_publisher),

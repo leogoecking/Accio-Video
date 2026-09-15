@@ -650,6 +650,22 @@ class TestTaskService(unittest.TestCase):
             match_script_order=True,
         )
 
+    def test_generate_terms_requests_more_visual_concepts_for_long_narration(self):
+        params = VideoParams(
+            video_subject="Ciência",
+            match_materials_to_script=True,
+            video_clip_duration=3,
+        )
+        script = " ".join(["palavra"] * 194)
+
+        with patch.object(
+            tm.llm, "generate_terms", return_value=["visual scene"]
+        ) as generate:
+            tm.generate_terms("task-id", params, script)
+
+        self.assertEqual(generate.call_args.kwargs["amount"], 14)
+        self.assertTrue(generate.call_args.kwargs["match_script_order"])
+
     def test_start_stops_before_materials_when_term_provider_fails(self):
         """
         关键词 Provider 失败后，任务必须立即结束，不能继续生成音频或下载素材。

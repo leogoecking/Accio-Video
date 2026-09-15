@@ -20,9 +20,37 @@ from app.utils import utils
 
 
 MATERIAL_SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
-_CACHE_FORMAT_VERSION = 2
+_CACHE_FORMAT_VERSION = 3
 _CACHE_CLEANUP_INTERVAL_SECONDS = 60 * 60
 _CACHE_FILE_PATTERN = re.compile(r"^[0-9a-f]{64}\.json$")
+
+
+def public_material_keywords(value) -> list[str]:
+    """Extract short words, including model numbers, without keeping URL tokens."""
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple)):
+        return []
+    words: list[str] = []
+    for entry in values[:20]:
+        if not isinstance(entry, str):
+            continue
+        for token in entry.lower().split():
+            if any(marker in token for marker in ("://", "=", "@")):
+                continue
+            for word in re.findall(r"[^\W_]+", token):
+                if len(word) > 32 or (len(word) == 1 and not word.isdigit()):
+                    continue
+                if word not in words:
+                    words.append(word)
+                    if len(words) == 20:
+                        return words
+    return words
+
+
+def material_keyword_digest(word: str, search_term: str) -> str:
+    """Bind cached keyword comparisons to the search without storing the word."""
+    return hashlib.sha256(f"{search_term}\0{word}".encode("utf-8")).hexdigest()
+
 
 # API 默认允许多个视频任务并发执行。固定数量的锁分片可以让相同搜索条件共用
 # 一个锁，同时避免按关键词永久保存 Lock 导致内存持续增长。它只负责合并当前
@@ -50,7 +78,7 @@ def _safe_public_url(value) -> str | None:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
-def _cached_source_info(item: MaterialInfo) -> dict | None:
+def _cached_source_info(item: MaterialInfo, search_term: str) -> dict | None:
     """
     按白名单构造可落盘的来源信息。
 
@@ -71,6 +99,11 @@ def _cached_source_info(item: MaterialInfo) -> dict | None:
         cached["asset_id"] = str(asset_id)
     if source_page:
         cached["source_page"] = source_page
+    keywords = public_material_keywords(source.get("keywords"))
+    if keywords:
+        cached["keyword_hashes"] = [
+            material_keyword_digest(word, search_term) for word in keywords
+        ]
 
     raw_creator = source.get("creator")
     if isinstance(raw_creator, dict):
@@ -322,7 +355,7 @@ def save_material_search_cache(
     try:
         serialized_items = []
         for item in items:
-            source_info = _cached_source_info(item)
+            source_info = _cached_source_info(item, search_term)
             if not item.url or item.duration <= 0 or not source_info:
                 continue
             serialized_items.append(
@@ -386,7 +419,7 @@ def cleanup_expired_material_search_cache(
     force: bool = False,
 ) -> int:
     """
-    低频清理没有再次被查询到的过期搜索缓存。
+    低频清理没有再次被查询到的过期或旧格式搜索缓存。
 
     正常写入路径每小时最多扫描一次目录，避免每次搜索都产生线性目录遍历；
     ``force`` 仅供测试或显式维护调用。只删除 SHA-256 命名的 JSON 文件，不会
@@ -427,7 +460,16 @@ def cleanup_expired_material_search_cache(
                     continue
                 cache_age = current_time - entry.stat(follow_symlinks=False).st_mtime
                 if 0 <= cache_age < MATERIAL_SEARCH_CACHE_TTL_SECONDS:
-                    continue
+                    try:
+                        with open(entry.path, encoding="utf-8") as cache_file:
+                            payload = json.load(cache_file)
+                        if (
+                            isinstance(payload, dict)
+                            and payload.get("version") == _CACHE_FORMAT_VERSION
+                        ):
+                            continue
+                    except (OSError, ValueError):
+                        pass
                 os.unlink(entry.path)
                 deleted_count += 1
             except OSError as exc:

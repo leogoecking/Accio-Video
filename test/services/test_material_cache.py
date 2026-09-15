@@ -35,6 +35,7 @@ class TestMaterialSearchCache(unittest.TestCase):
                 "search_term": "nature",
                 "asset_id": "123",
                 "source_page": "https://pixabay.com/videos/example-123/",
+                "keywords": ["forest", "river"],
                 "creator": {
                     "id": "456",
                     "name": "Creator",
@@ -82,6 +83,12 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertEqual(loaded[0].duration, 12)
         self.assertEqual(loaded[0].source_info["search_term"], "nature")
         self.assertEqual(loaded[0].source_info["asset_id"], "123")
+        self.assertNotIn("keywords", loaded[0].source_info)
+        self.assertEqual(len(loaded[0].source_info["keyword_hashes"]), 2)
+        self.assertEqual(
+            material._material_rank(loaded[0], "forest", VideoAspect.portrait, 5),
+            material._material_rank(self._item(), "forest", VideoAspect.portrait, 5),
+        )
         self.assertEqual(
             loaded[0].source_info["source_page"],
             "https://pixabay.com/videos/example-123/",
@@ -188,6 +195,7 @@ class TestMaterialSearchCache(unittest.TestCase):
         item = self._item()
         item.source_info["source_page"] += "?token=drop"
         item.source_info["creator"]["profile_page"] += "?key=drop"
+        item.source_info["keywords"].append("https://example.com/?token=secret")
         material_cache.save_material_search_cache(
             provider="pixabay",
             search_term="private search term",
@@ -203,13 +211,59 @@ class TestMaterialSearchCache(unittest.TestCase):
         payload = json.loads(raw_payload)
         self.assertEqual(set(payload), {"version", "items"})
         self.assertNotIn("private search term", raw_payload)
+        self.assertNotIn("forest", raw_payload)
+        self.assertNotIn("river", raw_payload)
         self.assertNotIn("token=drop", raw_payload)
+        self.assertNotIn("token=secret", raw_payload)
+
+    def test_keyword_cache_uses_search_bound_digests(self):
+        item = self._item()
+        item.source_info["keywords"] = ["unpublishedbrand", "iPhone 17"]
+        material_cache.save_material_search_cache(
+            provider="pixabay",
+            search_term="iPhone 17",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+            items=[item],
+        )
+        raw_payload = next(Path(self.temp_dir.name).glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("unpublishedbrand", raw_payload)
+        self.assertNotIn("iphone", raw_payload.lower())
+        loaded = material_cache.load_material_search_cache(
+            provider="pixabay",
+            search_term="iPhone 17",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+        )
+        self.assertEqual(
+            material._material_rank(loaded[0], "iPhone 17", VideoAspect.portrait, 5),
+            material._material_rank(item, "iPhone 17", VideoAspect.portrait, 5),
+        )
+
+    def test_cleanup_removes_recent_legacy_plaintext_cache(self):
+        material_cache.save_material_search_cache(
+            provider="pixabay",
+            search_term="nature",
+            minimum_duration=5,
+            video_aspect=VideoAspect.portrait,
+            items=[self._item()],
+        )
+        cache_path = self._cache_path()
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        payload["version"] = 2
+        payload["items"][0]["source_info"]["keywords"] = ["unpublishedbrand"]
+        cache_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        self.assertEqual(
+            material_cache.cleanup_expired_material_search_cache(force=True), 1
+        )
+        self.assertFalse(cache_path.exists())
 
     def test_coverr_signed_urls_are_never_cached(self):
         """Coverr 下载地址包含签名 JWT，不能进入可长期保留的磁盘缓存。"""
-        item = self._item(
-            "https://storage.coverr.co/video/download?token=signed-jwt"
-        )
+        item = self._item("https://storage.coverr.co/video/download?token=signed-jwt")
         item.provider = "coverr"
         item.source_info["provider"] = "coverr"
 
@@ -445,11 +499,14 @@ class TestMaterialSearchCache(unittest.TestCase):
         remote_items = [self._item()]
         remote_search = Mock(return_value=remote_items)
 
-        with patch.object(
-            material_cache,
-            "load_material_search_cache",
-            side_effect=RuntimeError("cache read failed"),
-        ), patch.object(material_cache.logger, "warning") as warning:
+        with (
+            patch.object(
+                material_cache,
+                "load_material_search_cache",
+                side_effect=RuntimeError("cache read failed"),
+            ),
+            patch.object(material_cache.logger, "warning") as warning,
+        ):
             results = material._search_videos_with_cache(
                 provider="pixabay",
                 search_videos=remote_search,
@@ -467,15 +524,19 @@ class TestMaterialSearchCache(unittest.TestCase):
         remote_items = [self._item()]
         remote_search = Mock(return_value=remote_items)
 
-        with patch.object(
-            material_cache,
-            "load_material_search_cache",
-            return_value=None,
-        ), patch.object(
-            material_cache,
-            "save_material_search_cache",
-            side_effect=RuntimeError("cache write failed"),
-        ), patch.object(material_cache.logger, "warning") as warning:
+        with (
+            patch.object(
+                material_cache,
+                "load_material_search_cache",
+                return_value=None,
+            ),
+            patch.object(
+                material_cache,
+                "save_material_search_cache",
+                side_effect=RuntimeError("cache write failed"),
+            ),
+            patch.object(material_cache.logger, "warning") as warning,
+        ):
             results = material._search_videos_with_cache(
                 provider="pixabay",
                 search_videos=remote_search,
@@ -549,8 +610,8 @@ class TestMaterialSearchCache(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0], results[1])
 
-    def test_cleanup_removes_expired_entries_only(self):
-        """低频清理只删除过期缓存，不应影响有效缓存或用户的其它文件。"""
+    def test_cleanup_preserves_fresh_current_entries(self):
+        """低频清理删除旧缓存，但保留当前格式和用户的其它文件。"""
         stale_path = self._cache_path()
         stale_path.write_text(
             json.dumps(
@@ -573,7 +634,22 @@ class TestMaterialSearchCache(unittest.TestCase):
             minimum_duration=5,
             video_aspect=VideoAspect.landscape,
         )
-        fresh_path.write_text("{}", encoding="utf-8")
+        fresh_path.write_text(
+            json.dumps(
+                {
+                    "version": material_cache._CACHE_FORMAT_VERSION,
+                    "items": [
+                        {
+                            "provider": "pexels",
+                            "url": "https://example.com/fresh.mp4",
+                            "duration": 12,
+                            "source_info": {"provider": "pexels"},
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
         unrelated_path = Path(self.temp_dir.name) / "notes.json"
         unrelated_path.write_text("keep", encoding="utf-8")
 

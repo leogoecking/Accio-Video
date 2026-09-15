@@ -14,7 +14,16 @@ from app.services.youtube_publisher import youtube_publisher
 SUPPORTED_PLATFORMS = frozenset({"youtube", "instagram", "tiktok", "facebook"})
 
 
-def compose_caption(metadata: dict[str, Any], max_length: int = 2200) -> str:
+def _truncate_text(text: str, max_length: int, max_bytes: int | None = None) -> str:
+    truncated = text[:max_length]
+    if max_bytes is not None:
+        truncated = truncated.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+    return truncated.rstrip()
+
+
+def compose_caption(
+    metadata: dict[str, Any], max_length: int = 2200, *, max_bytes: int | None = None
+) -> str:
     """Join an editable caption and its normalized hashtags within platform limits."""
     caption = str(metadata.get("caption") or metadata.get("title") or "").strip()
     hashtags = llm.normalize_hashtags(metadata.get("hashtags", []), count=30)
@@ -22,14 +31,20 @@ def compose_caption(metadata: dict[str, Any], max_length: int = 2200) -> str:
     suffix = " ".join(tag for tag in hashtags if tag.casefold() not in existing)
 
     if not suffix:
-        return caption[:max_length].rstrip()
+        return _truncate_text(caption, max_length, max_bytes)
     if not caption:
-        return suffix[:max_length].rstrip()
+        return _truncate_text(suffix, max_length, max_bytes)
 
     caption_limit = max(0, max_length - len(suffix) - 2)
-    if caption_limit == 0:
-        return suffix[:max_length].rstrip()
-    return f"{caption[:caption_limit].rstrip()}\n\n{suffix}".rstrip()
+    caption_byte_limit = (
+        max(0, max_bytes - len(suffix.encode("utf-8")) - 2)
+        if max_bytes is not None
+        else None
+    )
+    if caption_limit == 0 or caption_byte_limit == 0:
+        return _truncate_text(suffix, max_length, max_bytes)
+    prefix = _truncate_text(caption, caption_limit, caption_byte_limit)
+    return f"{prefix}\n\n{suffix}" if prefix else suffix
 
 
 def configured_platforms() -> list[str]:
@@ -101,7 +116,7 @@ def publish_video(
         return youtube_publisher.upload_video(
             video_path,
             title=metadata.get("title", ""),
-            description=metadata.get("caption", ""),
+            description=compose_caption(metadata, max_length=5000, max_bytes=5000),
             tags=metadata.get("hashtags", []),
             privacy_status=youtube_privacy_status,
             contains_synthetic_media=True,
@@ -125,7 +140,9 @@ def publish_video(
         youtube_extra=(
             {
                 "youtube_title": metadata.get("title", ""),
-                "youtube_description": metadata.get("caption", ""),
+                "youtube_description": compose_caption(
+                    metadata, max_length=5000, max_bytes=5000
+                ),
                 "tags": metadata.get("hashtags", []),
                 "privacyStatus": youtube_privacy_status,
                 "containsSyntheticMedia": True,

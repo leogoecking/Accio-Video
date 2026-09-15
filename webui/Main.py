@@ -4300,11 +4300,16 @@ def _render_local_script_generation(params):
                 custom_system_prompt=params.custom_system_prompt,
                 app_config=app_config_snapshot,
             )
+            if not script or "Error: " in script:
+                return script, []
             terms = llm.generate_terms(
                 params.video_subject,
                 script,
-                amount=8 if params.match_materials_to_script else 5,
-                match_script_order=params.match_materials_to_script,
+                amount=tm.recommended_material_term_count(params, script),
+                match_script_order=(
+                    params.match_materials_to_script
+                    or params.video_source == "ai_image"
+                ),
                 app_config=app_config_snapshot,
             )
             return script, terms
@@ -4313,10 +4318,23 @@ def _render_local_script_generation(params):
             "generate_script_and_terms",
             generate_script_and_terms,
         )
-        if "Error: " in script:
+        if not script:
+            st.error(
+                _publishing_text(
+                    "Could not generate the video script. Try again.",
+                    "Não foi possível gerar o roteiro do vídeo. Tente novamente.",
+                )
+            )
+        elif "Error: " in script:
             st.error(tr(script))
-        elif "Error: " in terms:
-            st.error(tr(terms))
+        elif not terms:
+            st.session_state["video_script"] = script
+            st.error(
+                _publishing_text(
+                    "Could not generate enough distinct video keywords. Try again or enter them manually.",
+                    "Não foi possível gerar palavras-chave visuais distintas suficientes. Tente novamente ou informe-as manualmente.",
+                )
+            )
         else:
             st.session_state["video_script"] = script
             st.session_state["video_terms"] = ", ".join(terms)
@@ -4771,13 +4789,23 @@ def _render_script_settings(panel, params):
                             lambda app_config_snapshot: llm.generate_terms(
                                 params.video_subject,
                                 params.video_script,
-                                amount=8 if params.match_materials_to_script else 5,
-                                match_script_order=params.match_materials_to_script,
+                                amount=tm.recommended_material_term_count(
+                                    params, params.video_script
+                                ),
+                                match_script_order=(
+                                    params.match_materials_to_script
+                                    or params.video_source == "ai_image"
+                                ),
                                 app_config=app_config_snapshot,
                             ),
                         )
-                        if "Error: " in terms:
-                            st.error(tr(terms))
+                        if not terms:
+                            st.error(
+                                _publishing_text(
+                                    "Could not generate enough distinct video keywords. Try again or enter them manually.",
+                                    "Não foi possível gerar palavras-chave visuais distintas suficientes. Tente novamente ou informe-as manualmente.",
+                                )
+                            )
                         else:
                             st.session_state["video_terms"] = ", ".join(terms)
 
@@ -4786,6 +4814,22 @@ def _render_script_settings(panel, params):
                 help=tr("Video Keywords Help"),
                 key="video_terms",
             )
+            if params.match_materials_to_script and params.video_script:
+                entered_terms = [
+                    term.strip()
+                    for term in re.split(r"[,，\n]", params.video_terms or "")
+                    if term.strip()
+                ]
+                recommended = tm.recommended_material_term_count(
+                    params, params.video_script
+                )
+                if entered_terms and len(entered_terms) < recommended:
+                    st.caption(
+                        _publishing_text(
+                            f"This script has {len(entered_terms)} visual keywords. Around {recommended} would reduce repeated themes. You can generate keywords again or add your own.",
+                            f"Este roteiro tem {len(entered_terms)} palavras-chave visuais. Cerca de {recommended} reduziriam a repetição de temas. Você pode gerar novamente ou adicionar outras.",
+                        )
+                    )
 
 
 def _render_video_settings(panel, params):
@@ -7252,6 +7296,20 @@ def _render_application():
     right_panel = panel[3]
 
     params = VideoParams(video_subject="")
+    # Script controls render before video controls, but keyword generation needs
+    # the selected source and clip duration from the current UI session.
+    selected_source = st.session_state.get(
+        "video_source_select", config.app.get("video_source", "pexels")
+    )
+    if isinstance(selected_source, str) and selected_source in {
+        "pexels", "pixabay", "coverr", "ai_image", "wavespeed", "loomloom", "local"
+    }:
+        params.video_source = selected_source
+    selected_duration = st.session_state.get(
+        "video_clip_duration_select", config.ui.get("video_clip_duration", 3)
+    )
+    if isinstance(selected_duration, int) and selected_duration in range(2, 11):
+        params.video_clip_duration = selected_duration
     params.match_materials_to_script = bool(
         st.session_state.get("match_materials_to_script", False)
     )

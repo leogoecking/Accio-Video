@@ -625,18 +625,21 @@ def _strip_code_fence(text: str) -> str:
 def generate_terms(
     video_subject: str,
     video_script: str,
-    amount: int = 5,
+    amount: int | None = 5,
     match_script_order: bool = False,
     app_config=None,
 ) -> List[str]:
+    amount = amount if isinstance(amount, int) and amount > 0 else 5
     if match_script_order:
         goal = (
             f"Generate {amount} chronological stock-video search terms that follow "
             "the order of topics in the video script."
         )
         ordering_rule = (
-            "6. keep the terms in the same order as the script narration; "
-            "earlier terms must describe earlier visual moments."
+            "7. keep the terms in the same order as the script narration; "
+            "earlier terms must describe earlier visual moments.\n"
+            "8. vary visible subjects, actions and settings across the terms; "
+            "do not repeat the same visual idea with synonyms."
         )
         # 有序关键词模式下，示例数量要和 amount 保持一致，避免模型被固定
         # 的 4 个示例误导，导致长文案只返回少量关键词，影响素材覆盖度。
@@ -669,6 +672,7 @@ def generate_terms(
 3. avoid overly abstract or metaphorical words (e.g. do not search "future success", search "smiling person celebrating in modern office").
 4. do not force the main title into every tag; prioritize what should actually be VISIBLE on screen for each moment in the narration.
 5. reply with english search terms only; Chinese or other languages are not accepted.
+6. return exactly {amount} distinct search terms.
 {ordering_rule}
 
 ## Output Example:
@@ -687,7 +691,6 @@ Please note that you must use English for generating video search terms.
     logger.info(f"subject: {video_subject}, match_script_order: {match_script_order}")
 
     search_terms = []
-    response = ""
     for i in range(_max_retries):
         try:
             if app_config is None:
@@ -701,32 +704,44 @@ Please note that you must use English for generating video search terms.
                 # 这里统一返回空列表，让任务编排层在真实故障位置立即结束任务。
                 logger.error(f"failed to generate video terms: {response}")
                 return []
-            search_terms = json.loads(_strip_code_fence(response))
-            if not isinstance(search_terms, list) or not all(
-                isinstance(term, str) for term in search_terms
-            ):
-                logger.error("response is not a list of strings.")
-                continue
+            try:
+                parsed_terms = json.loads(_strip_code_fence(response))
+            except json.JSONDecodeError:
+                match = re.search(r"\[.*]", response, re.DOTALL)
+                if not match:
+                    raise ValueError("response has no JSON array")
+                parsed_terms = json.loads(match.group())
 
+            if not isinstance(parsed_terms, list) or not all(
+                isinstance(term, str) for term in parsed_terms
+            ):
+                raise ValueError("response is not a list of strings")
+
+            unique_terms = []
+            seen = set()
+            for raw_term in parsed_terms:
+                term = " ".join(raw_term.split())
+                key = term.casefold()
+                if term and key not in seen:
+                    unique_terms.append(term)
+                    seen.add(key)
+            if len(unique_terms) < amount:
+                logger.warning(
+                    f"video term response had {len(unique_terms)} distinct terms, "
+                    f"requested {amount}"
+                )
+                continue
+            search_terms = unique_terms[:amount]
+            break
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
-            if response:
-                match = re.search(r"\[.*]", response, re.DOTALL)
-                if match:
-                    try:
-                        search_terms = json.loads(match.group())
-                    except Exception as e:
-                        # 这里保留重试流程，但必须记录 LLM 返回的非标准 JSON，
-                        # 否则后续排查搜索词为空时无法定位
-                        # 是模型格式问题还是解析逻辑问题。
-                        logger.warning(f"failed to generate video terms: {str(e)}")
-
-        if search_terms and len(search_terms) > 0:
-            break
-        if i < _max_retries:
+        if i < _max_retries - 1:
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
 
-    logger.success(f"completed: \n{search_terms}")
+    if not search_terms:
+        logger.error(f"failed to generate {amount} distinct video terms")
+    else:
+        logger.success(f"completed: \n{search_terms}")
     return search_terms
 
 

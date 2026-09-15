@@ -293,6 +293,178 @@ def _filter_materials_by_aspect(
     return filtered_items
 
 
+_MATERIAL_SEARCH_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "de",
+        "do",
+        "da",
+        "dos",
+        "das",
+        "em",
+        "for",
+        "in",
+        "of",
+        "on",
+        "the",
+        "um",
+        "uma",
+        "with",
+    }
+)
+
+
+def _material_rank(
+    item: MaterialInfo,
+    search_term: str,
+    video_aspect: VideoAspect,
+    max_clip_duration: int,
+) -> float:
+    """Rank stock results from public metadata without requesting another API."""
+    source = item.source_info if isinstance(item.source_info, dict) else {}
+    query_words = set(material_cache.public_material_keywords(search_term))
+    query_words -= _MATERIAL_SEARCH_STOPWORDS
+    candidate_words = set(
+        material_cache.public_material_keywords(source.get("keywords"))
+    )
+    source_page = _safe_public_url(source.get("source_page"))
+    if source_page:
+        candidate_words.update(
+            material_cache.public_material_keywords(
+                urlsplit(source_page).path.replace("-", " ")
+            )
+        )
+    matched_words = query_words & candidate_words
+    keyword_hashes = source.get("keyword_hashes")
+    if isinstance(keyword_hashes, list):
+        salt = source.get("search_term") or search_term
+        if isinstance(salt, str):
+            hashes = {value for value in keyword_hashes if isinstance(value, str)}
+            matched_words.update(
+                word
+                for word in query_words
+                if material_cache.material_keyword_digest(word, salt) in hashes
+            )
+    relevance = len(matched_words) / len(query_words) if query_words else 0.0
+
+    rendition = (
+        source.get("rendition") if isinstance(source.get("rendition"), dict) else {}
+    )
+    try:
+        width = float(rendition.get("width") or 0)
+        height = float(rendition.get("height") or 0)
+    except (TypeError, ValueError):
+        width = height = 0
+    framing = quality = 0.0
+    if width > 0 and height > 0:
+        target_width, target_height = VideoAspect(video_aspect).to_resolution()
+        aspect_ratio = (width / height) / (target_width / target_height)
+        framing = min(aspect_ratio, 1 / aspect_ratio)
+        quality = min(1.0, width / target_width, height / target_height)
+    duration = min(1.0, max(0, item.duration) / max(1, 2 * max_clip_duration))
+    return 0.5 * relevance + 0.25 * framing + 0.2 * quality + 0.05 * duration
+
+
+def _rank_materials(
+    items: List[MaterialInfo],
+    search_term: str,
+    video_aspect: VideoAspect,
+    max_clip_duration: int,
+    *,
+    variation_key: str | None = None,
+) -> List[MaterialInfo]:
+    # Stable sort preserves provider ranking where no metadata distinguishes items.
+    ranked = sorted(
+        items,
+        key=lambda item: _material_rank(
+            item, search_term, video_aspect, max_clip_duration
+        ),
+        reverse=True,
+    )
+    if variation_key is None:
+        return ranked
+
+    # Vary only near-equal candidates from the provider's first few results.
+    rng = random.Random(f"{variation_key}:{search_term}")
+    for start in range(0, len(ranked), 5):
+        block = ranked[start : start + 5]
+        if not block:
+            continue
+        best_score = _material_rank(
+            block[0], search_term, video_aspect, max_clip_duration
+        )
+        close_count = 0
+        for item in block:
+            if (
+                best_score
+                - _material_rank(item, search_term, video_aspect, max_clip_duration)
+                > 0.04
+            ):
+                break
+            close_count += 1
+        alternatives = block[:close_count]
+        rng.shuffle(alternatives)
+        ranked[start : start + close_count] = alternatives
+    return ranked
+
+
+def _material_identities(item: MaterialInfo) -> set[tuple[str, str]]:
+    source = item.source_info if isinstance(item.source_info, dict) else {}
+    identities = {("url", item.url)}
+    asset_id = source.get("asset_id")
+    if asset_id not in (None, ""):
+        identities.add((str(item.provider), str(asset_id)))
+    return identities
+
+
+def _round_robin_materials(groups: list[list[MaterialInfo]]) -> List[MaterialInfo]:
+    return [
+        group[index]
+        for index in range(max((len(group) for group in groups), default=0))
+        for group in groups
+        if index < len(group)
+    ]
+
+
+def _allocate_material_groups(
+    groups: list[list[MaterialInfo]],
+) -> list[list[MaterialInfo]]:
+    """Give scarce terms their best unique assets before assigning shared results."""
+    allocated: list[list[MaterialInfo]] = [[] for _ in groups]
+    used: set[tuple[str, str]] = set()
+    # A term with just one result must get first claim on it; another term with
+    # many alternatives can then choose its next-best asset.
+    term_order = sorted(
+        range(len(groups)), key=lambda index: (len(groups[index]), index)
+    )
+    while True:
+        chosen = False
+        for index in term_order:
+            item = next(
+                (
+                    candidate
+                    for candidate in groups[index]
+                    if not (_material_identities(candidate) & used)
+                ),
+                None,
+            )
+            if item is None:
+                continue
+            allocated[index].append(item)
+            used.update(_material_identities(item))
+            chosen = True
+        if not chosen:
+            break
+    # If every result for a term is shared, reuse its best stock item as a last
+    # resort. This preserves the scene without triggering a paid AI fallback.
+    for index, group in enumerate(groups):
+        if group and not allocated[index]:
+            allocated[index].append(group[0])
+    return allocated
+
+
 def search_videos_pexels(
     search_term: str,
     minimum_duration: int,
@@ -361,7 +533,9 @@ def search_videos_pexels(
                     best_rendition = (w, h, video)
                     break
             if not best_rendition:
-                best_rendition = max(matching_renditions, key=lambda item: item[0] * item[1])
+                best_rendition = max(
+                    matching_renditions, key=lambda item: item[0] * item[1]
+                )
 
             w, h, video = best_rendition
             item = MaterialInfo()
@@ -371,16 +545,13 @@ def search_videos_pexels(
             item.source_info = {
                 "provider": "pexels",
                 "search_term": search_term,
-                "asset_id": (
-                    str(v.get("id")) if v.get("id") is not None else None
-                ),
+                "asset_id": (str(v.get("id")) if v.get("id") is not None else None),
                 "source_page": _safe_public_url(v.get("url")),
+                "keywords": material_cache.public_material_keywords(v.get("tags")),
                 "creator": _creator_info(v.get("user")),
                 "rendition": {
                     "id": (
-                        str(video.get("id"))
-                        if video.get("id") is not None
-                        else None
+                        str(video.get("id")) if video.get("id") is not None else None
                     ),
                     "width": w,
                     "height": h,
@@ -473,7 +644,8 @@ def search_videos_pixabay(
             if duration < minimum_duration:
                 continue
             video_files = v["videos"]
-            # loop through each url to determine the best quality
+            # Select the best matching rendition, independent of API dict order.
+            matching_renditions = []
             for video_type in video_files:
                 video = video_files[video_type]
                 try:
@@ -486,32 +658,34 @@ def search_videos_pixabay(
                 orientation_matches = aspect == VideoAspect.square or (
                     _matches_video_aspect(w, h, aspect)
                 )
-                if orientation_matches and w >= video_width:
-                    item = MaterialInfo()
-                    item.provider = "pixabay"
-                    item.url = video["url"]
-                    item.duration = duration
-                    item.source_info = {
-                        "provider": "pixabay",
-                        "search_term": search_term,
-                        "asset_id": (
-                            str(v.get("id")) if v.get("id") is not None else None
-                        ),
-                        "source_page": _safe_public_url(v.get("pageURL")),
-                        "creator": _creator_info(
-                            {
-                                "id": v.get("user_id"),
-                                "name": v.get("user"),
-                            }
-                        ),
-                        "rendition": {
-                            "id": video_type,
-                            "width": w,
-                            "height": video.get("height"),
-                        },
-                    }
-                    video_items.append(item)
-                    break
+                if orientation_matches and min(w, h) >= 480 and video.get("url"):
+                    matching_renditions.append((w, h, video_type, video))
+            if not matching_renditions:
+                continue
+            w, h, video_type, video = max(
+                matching_renditions,
+                key=lambda candidate: (
+                    candidate[0] == video_width and candidate[1] == video_height,
+                    candidate[0] * candidate[1],
+                ),
+            )
+            item = MaterialInfo(
+                provider="pixabay",
+                url=video["url"],
+                duration=duration,
+                source_info={
+                    "provider": "pixabay",
+                    "search_term": search_term,
+                    "asset_id": str(v.get("id")) if v.get("id") is not None else None,
+                    "source_page": _safe_public_url(v.get("pageURL")),
+                    "keywords": material_cache.public_material_keywords(v.get("tags")),
+                    "creator": _creator_info(
+                        {"id": v.get("user_id"), "name": v.get("user")}
+                    ),
+                    "rendition": {"id": video_type, "width": w, "height": h},
+                },
+            )
+            video_items.append(item)
         return video_items
     except Exception as e:
         error_message = _redact_request_error(e, api_key)
@@ -609,6 +783,16 @@ def search_videos_coverr(
                 "search_term": search_term,
                 "asset_id": str(video_id),
                 "source_page": _safe_public_url(v.get("canonical_url") or v.get("url")),
+                "keywords": material_cache.public_material_keywords(
+                    [
+                        v.get("title"),
+                        *(
+                            v.get("tags")
+                            if isinstance(v.get("tags"), list)
+                            else [v.get("tags")]
+                        ),
+                    ]
+                ),
                 "creator": _creator_info(v.get("creator") or v.get("author")),
                 "rendition": {
                     "id": "mp4_download",
@@ -1162,6 +1346,15 @@ def _search_videos_with_cache(
                     "material search cache write failed, use remote results: "
                     f"provider={provider}, error={type(exc).__name__}, detail={exc}"
                 )
+        # Use the same safe metadata shape on first search and cache hits.
+        # Provider keywords remain available to ranking only as search-bound
+        # digests; plaintext tags never enter task history through this path.
+        for item in items:
+            if isinstance(item.source_info, dict):
+                safe_source = material_cache._cached_source_info(item, search_term)
+                if safe_source:
+                    safe_source["search_term"] = search_term
+                    item.source_info = safe_source
         return items
 
 
@@ -1271,26 +1464,30 @@ def download_videos(
             material_directory=material_directory,
         )
 
-    valid_video_items = []
-    valid_video_urls = []
+    candidate_groups: list[list[MaterialInfo]] = []
     found_duration = 0.0
+    concat_mode_value = getattr(video_concat_mode, "value", video_concat_mode)
+    variation_key = (
+        task_id if concat_mode_value == VideoConcatMode.random.value else None
+    )
     for search_term in search_terms:
-        video_items = search_videos(
-            search_term=search_term,
-            minimum_duration=max_clip_duration,
-            video_aspect=video_aspect,
+        video_items = _rank_materials(
+            search_videos(
+                search_term=search_term,
+                minimum_duration=max_clip_duration,
+                video_aspect=video_aspect,
+            ),
+            search_term,
+            video_aspect,
+            max_clip_duration,
+            variation_key=variation_key,
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
 
-        found_for_term = False
-        for item in video_items:
-            if item.url not in valid_video_urls:
-                valid_video_items.append(item)
-                valid_video_urls.append(item.url)
-                found_duration += item.duration
-                found_for_term = True
+        term_items = list(video_items)
+        found_duration += sum(item.duration for item in term_items)
 
-        if not found_for_term and config.app.get("enable_ai_image_fallback", True):
+        if not video_items and config.app.get("enable_ai_image_fallback", True):
             try:
                 ai_clip_item = ai_image.generate_ai_video_clip(
                     prompt=search_term,
@@ -1298,23 +1495,24 @@ def download_videos(
                     video_aspect=video_aspect,
                     save_dir=material_directory or None,
                 )
-                if ai_clip_item and ai_clip_item.url not in valid_video_urls:
-                    valid_video_items.append(ai_clip_item)
-                    valid_video_urls.append(ai_clip_item.url)
+                if ai_clip_item:
+                    term_items.append(ai_clip_item)
                     found_duration += ai_clip_item.duration
                     logger.info(f"AI image Ken Burns clip added for '{search_term}'")
             except Exception as e:
                 logger.warning(f"AI image fallback failed for '{search_term}': {e}")
+        if term_items:
+            candidate_groups.append(term_items)
+
+    valid_video_items = _round_robin_materials(
+        _allocate_material_groups(candidate_groups)
+    )
 
     logger.info(
         f"found total videos: {len(valid_video_items)}, required duration: {audio_duration} seconds, found duration: {found_duration} seconds"
     )
     video_paths = []
     material_sources: list[dict[str, Any]] = []
-
-    concat_mode_value = getattr(video_concat_mode, "value", video_concat_mode)
-    if concat_mode_value == VideoConcatMode.random.value:
-        random.shuffle(valid_video_items)
 
     total_duration = 0.0
     for item in valid_video_items:
@@ -1385,7 +1583,9 @@ def _download_videos_ai_image_on_demand(
     needed_clips = math.ceil(max(audio_duration, 1.0) / clip_dur)
 
     # 2. 如果提供的搜索词少于所需片段数，自动扩充提示词视角，确保每个片段都有独特生动的画面
-    valid_base_terms = [t.strip() for t in search_terms if isinstance(t, str) and t.strip()]
+    valid_base_terms = [
+        t.strip() for t in search_terms if isinstance(t, str) and t.strip()
+    ]
     if not valid_base_terms:
         valid_base_terms = ["cinematic scene"]
     expanded_terms = list(valid_base_terms)
@@ -1420,7 +1620,9 @@ def _download_videos_ai_image_on_demand(
             saved_video_path = save_video(item.url, save_dir=material_directory)
             if not saved_video_path:
                 continue
-            logger.info(f"AI image video saved ({idx+1}/{max(needed_clips, len(expanded_terms))}): {saved_video_path}")
+            logger.info(
+                f"AI image video saved ({idx + 1}/{max(needed_clips, len(expanded_terms))}): {saved_video_path}"
+            )
             video_paths.append(saved_video_path)
             try:
                 material_sources.append(_material_source_record(item, saved_video_path))
@@ -1435,9 +1637,13 @@ def _download_videos_ai_image_on_demand(
                 )
                 break
         except Exception as exc:
-            logger.warning(f"failed to generate AI image clip for {search_term!r}: {exc}")
+            logger.warning(
+                f"failed to generate AI image clip for {search_term!r}: {exc}"
+            )
 
-    logger.success(f"generated and prepared {len(video_paths)} distinct AI image videos")
+    logger.success(
+        f"generated and prepared {len(video_paths)} distinct AI image videos"
+    )
     _persist_material_sources(task_id, material_sources)
     return video_paths
 
@@ -1534,27 +1740,26 @@ def _download_videos_by_script_order(
     """
     logger.info("downloading videos with script-order material matching")
     candidate_groups = []
-    valid_video_urls = set()
     found_duration = 0.0
 
     for search_term in search_terms:
-        video_items = search_videos(
-            search_term=search_term,
-            minimum_duration=max_clip_duration,
-            video_aspect=video_aspect,
+        video_items = _rank_materials(
+            search_videos(
+                search_term=search_term,
+                minimum_duration=max_clip_duration,
+                video_aspect=video_aspect,
+            ),
+            search_term,
+            video_aspect,
+            max_clip_duration,
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
 
-        term_items = []
-        for item in video_items:
-            if item.url in valid_video_urls:
-                continue
-            term_items.append(item)
-            valid_video_urls.add(item.url)
-            found_duration += item.duration
+        term_items = list(video_items)
+        found_duration += sum(item.duration for item in term_items)
 
         # If zero stock videos found for this ordered term, trigger AI Image Ken Burns fallback
-        if not term_items and config.app.get("enable_ai_image_fallback", True):
+        if not video_items and config.app.get("enable_ai_image_fallback", True):
             try:
                 ai_clip_item = ai_image.generate_ai_video_clip(
                     prompt=search_term,
@@ -1564,7 +1769,6 @@ def _download_videos_by_script_order(
                 )
                 if ai_clip_item:
                     term_items.append(ai_clip_item)
-                    valid_video_urls.add(ai_clip_item.url)
                     found_duration += ai_clip_item.duration
                     logger.info(f"AI image Ken Burns clip added for '{search_term}'")
             except Exception as e:
@@ -1572,6 +1776,14 @@ def _download_videos_by_script_order(
 
         if term_items:
             candidate_groups.append((search_term, term_items))
+
+    allocated_groups = _allocate_material_groups(
+        [items for _, items in candidate_groups]
+    )
+    candidate_groups = [
+        (search_term, items)
+        for (search_term, _), items in zip(candidate_groups, allocated_groups)
+    ]
 
     logger.info(
         f"found total ordered video candidates: {sum(len(items) for _, items in candidate_groups)}, "

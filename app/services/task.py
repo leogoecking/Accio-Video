@@ -308,6 +308,21 @@ def generate_script(task_id, params):
     return video_script
 
 
+def recommended_material_term_count(params, video_script: str) -> int:
+    """Estimate how many distinct visual searches a narrated video needs."""
+    if getattr(params, "video_source", "") == "ai_image":
+        return 10
+    if not params.match_materials_to_script:
+        return 5
+    # Roughly one visual concept per two clips limits thematic repetition
+    # without making a separate stock request for every three-second scene.
+    words = len(video_script.split())
+    estimated_clips = math.ceil(
+        (words * 60 / 140) / max(1, params.video_clip_duration)
+    )
+    return min(16, max(8, math.ceil(estimated_clips / 2)))
+
+
 def generate_terms(task_id, params, video_script):
     logger.info("\n\n## generating video terms")
     video_terms = params.video_terms
@@ -315,7 +330,7 @@ def generate_terms(task_id, params, video_script):
         # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
         # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
         # 无法改善“后面内容的画面提前出现”的问题。
-        term_count = 10 if getattr(params, "video_source", "") == "ai_image" else (8 if params.match_materials_to_script else 5)
+        term_count = recommended_material_term_count(params, video_script)
         video_terms = llm.generate_terms(
             video_subject=params.video_subject,
             video_script=video_script,
