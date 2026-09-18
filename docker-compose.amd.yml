@@ -1,0 +1,10 @@
+# AMD VAAPI override. Use together with docker-compose.yml on a Linux host.
+# RX 6600 is renderD128 on the benchmarked host. Set video_vaapi_device in
+# config.toml to match this device. Use renderD129 to select the integrated GPU.
+services:
+  webui:
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+  api:
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128

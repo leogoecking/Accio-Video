@@ -1,4 +1,5 @@
 import os
+import json
 import subprocess
 import tempfile
 import unittest
@@ -116,6 +117,7 @@ class TestFFmpegVideoUtils(unittest.TestCase):
 
         fg_zoom, _ = ffmpeg_video.build_subclip_filtergraph(1080, 1920, 3.0, transition_mode="ZoomIn")
         self.assertIn("zoompan=", fg_zoom)
+        self.assertNotIn(",fps=30,format", fg_zoom)
 
         # SlideIn complex
         fg_slide, is_complex_slide = ffmpeg_video.build_subclip_filtergraph(
@@ -123,6 +125,87 @@ class TestFFmpegVideoUtils(unittest.TestCase):
         )
         self.assertTrue(is_complex_slide)
         self.assertIn("overlay=", fg_slide)
+
+    def test_zoom_filters_render_expected_frames_without_queueing(self):
+        for mode in ("zoomin", "zoomout"):
+            for speed, source_duration in ((1.0, 1.0), (1.5, 1.5), (0.5, 0.5)):
+                with self.subTest(mode=mode, speed=speed):
+                    output = os.path.join(self.test_dir, f"zoom-{mode}-{speed}.mp4")
+                    filters, is_complex = ffmpeg_video.build_subclip_filtergraph(
+                        240, 320, 1.0, clip_speed=speed,
+                        transition_mode=mode, fps=30,
+                    )
+                    self.assertFalse(is_complex)
+                    self.assertIn("fps=30,zoompan=", filters)
+                    self.assertEqual(filters.count(",fps="), 1)
+                    result = subprocess.run(
+                        [self.ffmpeg_bin, "-v", "warning", "-y", "-ss", "0",
+                         "-t", str(source_duration), "-i", self.test_video,
+                         "-vf", filters, "-an", "-c:v", "libx264",
+                         "-threads", "2", output],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("buffers queued", result.stderr)
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "error", "-count_frames", "-show_entries",
+                         "stream=width,height,duration,nb_read_frames", "-of", "json", output],
+                        capture_output=True, text=True, check=True, timeout=10,
+                    )
+                    stream = json.loads(probe.stdout)["streams"][0]
+                    self.assertEqual((stream["width"], stream["height"]), (240, 320))
+                    self.assertEqual(int(stream["nb_read_frames"]), 30)
+                    self.assertAlmostEqual(float(stream["duration"]), 1.0, delta=1 / 30)
+
+    def test_zoom_filters_at_portrait_output_resolution(self):
+        for mode in ("zoomin", "zoomout"):
+            with self.subTest(mode=mode):
+                output = os.path.join(self.test_dir, f"portrait-{mode}.mp4")
+                filters, _ = ffmpeg_video.build_subclip_filtergraph(
+                    1080, 1920, 1.0, transition_mode=mode, fps=30,
+                )
+                result = subprocess.run(
+                    [self.ffmpeg_bin, "-v", "warning", "-y", "-ss", "0", "-t", "1",
+                     "-i", self.test_video, "-vf", filters, "-an", "-c:v", "libx264",
+                     "-threads", "2", output],
+                    capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("buffers queued", result.stderr)
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-count_frames", "-show_entries",
+                     "stream=width,height,duration,nb_read_frames", "-of", "json", output],
+                    capture_output=True, text=True, check=True, timeout=10,
+                )
+                stream = json.loads(probe.stdout)["streams"][0]
+                self.assertEqual((stream["width"], stream["height"]), (1080, 1920))
+                self.assertEqual(int(stream["nb_read_frames"]), 30)
+                self.assertAlmostEqual(float(stream["duration"]), 1.0, delta=1 / 30)
+
+    def test_slide_filters_keep_final_frame(self):
+        for mode in ("slidein", "slideout"):
+            with self.subTest(mode=mode):
+                output = os.path.join(self.test_dir, f"portrait-{mode}.mp4")
+                filters, is_complex = ffmpeg_video.build_subclip_filtergraph(
+                    1080, 1920, 1.0, transition_mode=mode, fps=30,
+                )
+                self.assertTrue(is_complex)
+                result = subprocess.run(
+                    [self.ffmpeg_bin, "-v", "warning", "-y", "-ss", "0", "-t", "1",
+                     "-i", self.test_video, "-filter_complex", filters,
+                     "-map", "[out]", "-an", "-c:v", "libx264",
+                     "-threads", "2", output],
+                    capture_output=True, text=True, timeout=15,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-count_frames", "-show_entries",
+                     "stream=duration,nb_read_frames", "-of", "json", output],
+                    capture_output=True, text=True, check=True, timeout=10,
+                )
+                stream = json.loads(probe.stdout)["streams"][0]
+                self.assertEqual(int(stream["nb_read_frames"]), 30)
+                self.assertAlmostEqual(float(stream["duration"]), 1.0, delta=1 / 30)
 
     def test_render_subclip_with_ffmpeg(self):
         out_clip = os.path.join(self.test_dir, "out_subclip.mp4")

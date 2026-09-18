@@ -116,7 +116,9 @@ def build_subclip_filtergraph(
         complex_filter = (
             f"[0:v]{speed_filter}{scale_pad_filter}[scaled];"
             f"color=c=black:s={target_width}x{target_height}:d={duration:.3f}[bg];"
-            f"[bg][scaled]overlay={overlay_pos},fps={fps},format=yuv420p[out]"
+            f"[bg][scaled]overlay={overlay_pos},"
+            f"tpad=stop_mode=clone:stop_duration={1 / fps:.6f},"
+            f"fps={fps},trim=duration={duration:.3f},format=yuv420p[out]"
         )
         return complex_filter, True
 
@@ -132,17 +134,24 @@ def build_subclip_filtergraph(
         st = max(0.0, duration - trans_dur)
         vf_parts.append(f"fade=t=out:st={st:.3f}:d={trans_dur:.3f}")
     elif transition_value in ("zoomin", "zoom_in"):
+        # Normalize source frames after speed changes, before zoompan generates
+        # one output frame per input frame. A second fps after zoompan stalls.
+        vf_parts.append(f"fps={fps}")
         vf_parts.append(
             f"zoompan=z='min(1.0+0.2*(on/{total_frames}),1.2)':d=1:"
             f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={target_width}x{target_height}:fps={fps}"
         )
     elif transition_value in ("zoomout", "zoom_out"):
+        vf_parts.append(f"fps={fps}")
         vf_parts.append(
             f"zoompan=z='max(1.2-0.2*(on/{total_frames}),1.0)':d=1:"
             f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={target_width}x{target_height}:fps={fps}"
         )
 
-    vf_parts.append(f"fps={fps}")
+    # zoompan already emits frames at the requested rate. Adding another fps
+    # filter here can queue thousands of frames and stall short clips.
+    if transition_value not in ("zoomin", "zoom_in", "zoomout", "zoom_out"):
+        vf_parts.append(f"fps={fps}")
     vf_parts.append("format=yuv420p")
     return ",".join(vf_parts), False
 
@@ -161,6 +170,8 @@ def render_subclip_with_ffmpeg(
     codec: str = "libx264",
     threads: int = 2,
     fps: int = 30,
+    vaapi_device: str | None = None,
+    vaapi_qp: int | None = None,
 ) -> bool:
     """
     使用纯 FFmpeg 滤镜图直接截取、缩放、变速并编码视频片段。
@@ -187,30 +198,41 @@ def render_subclip_with_ffmpeg(
     cmd = [
         ffmpeg_bin,
         "-y",
+        "-filter_threads",
+        str(threads or 2),
+        "-filter_complex_threads",
+        str(threads or 2),
+    ]
+    if codec == "h264_vaapi":
+        if not vaapi_device:
+            return False
+        cmd.extend(["-vaapi_device", vaapi_device])
+        if is_complex:
+            filter_str = filter_str.replace(
+                "[out]", "[software];[software]format=nv12,hwupload[out]"
+            )
+        else:
+            filter_str += ",format=nv12,hwupload"
+    cmd.extend([
         "-ss",
         f"{start_time:.3f}",
         "-t",
         f"{source_duration:.3f}",
         "-i",
         source_path,
-    ]
+    ])
 
     if is_complex:
         cmd.extend(["-filter_complex", filter_str, "-map", "[out]"])
     else:
         cmd.extend(["-vf", filter_str])
 
-    cmd.extend(
-        [
-            "-c:v",
-            codec,
-            "-threads",
-            str(threads or 2),
-            "-pix_fmt",
-            "yuv420p",
-            output_path,
-        ]
-    )
+    cmd.extend(["-an", "-c:v", codec, "-threads", str(threads or 2)])
+    if codec == "h264_vaapi":
+        cmd.extend(["-rc_mode", "CQP", "-qp", str(vaapi_qp or 18), "-bf", "0"])
+    else:
+        cmd.extend(["-pix_fmt", "yuv420p"])
+    cmd.append(output_path)
 
     try:
         res = subprocess.run(
@@ -239,6 +261,8 @@ def render_image_to_video_with_ffmpeg(
     codec: str = "libx264",
     threads: int = 2,
     fps: int = 30,
+    vaapi_device: str | None = None,
+    vaapi_qp: int | None = None,
 ) -> bool:
     """
     使用 FFmpeg zoompan 滤镜将静态图片转换为带有 Ken Burns 动态缩放效果的短视频。
@@ -265,6 +289,13 @@ def render_image_to_video_with_ffmpeg(
     cmd = [
         ffmpeg_bin,
         "-y",
+    ]
+    if codec == "h264_vaapi":
+        if not vaapi_device:
+            return False
+        cmd.extend(["-vaapi_device", vaapi_device])
+        vf += ",format=nv12,hwupload"
+    cmd.extend([
         "-loop",
         "1",
         "-i",
@@ -277,10 +308,12 @@ def render_image_to_video_with_ffmpeg(
         codec,
         "-threads",
         str(threads or 2),
-        "-pix_fmt",
-        "yuv420p",
-        output_path,
-    ]
+    ])
+    if codec == "h264_vaapi":
+        cmd.extend(["-rc_mode", "CQP", "-qp", str(vaapi_qp or 18), "-bf", "0"])
+    else:
+        cmd.extend(["-pix_fmt", "yuv420p"])
+    cmd.append(output_path)
 
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, check=False)

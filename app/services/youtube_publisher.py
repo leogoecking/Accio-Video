@@ -27,6 +27,10 @@ class YouTubePublisher:
     VIDEO_URL = "https://www.youtube.com/watch?v={video_id}"
     UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
     VALID_PRIVACY_STATUSES = frozenset({"public", "unlisted", "private"})
+    REAUTHORIZATION_MESSAGE = (
+        "YouTube authorization expired or was revoked. "
+        "Reconnect the account in Publishing settings."
+    )
 
     def _setting(self, name: str, default: Any = "") -> Any:
         return config.app.get(f"youtube_direct_{name}", default)
@@ -76,7 +80,12 @@ class YouTubePublisher:
 
     def is_authorized(self) -> bool:
         token = self._load_token()
-        return bool(token.get("refresh_token") or token.get("access_token"))
+        return not token.get("reauthorization_required") and bool(
+            token.get("refresh_token") or token.get("access_token")
+        )
+
+    def needs_reauthorization(self) -> bool:
+        return bool(self._load_token().get("reauthorization_required"))
 
     def is_configured(self) -> bool:
         return self.enabled and self.has_client_credentials() and self.is_authorized()
@@ -250,6 +259,8 @@ class YouTubePublisher:
 
     def _get_access_token(self) -> str:
         token = self._load_token()
+        if token.get("reauthorization_required"):
+            raise RuntimeError(self.REAUTHORIZATION_MESSAGE)
         access_token = str(token.get("access_token") or "")
         expires_at = float(token.get("expires_at") or 0)
         if access_token and expires_at > time.time() + 60:
@@ -268,7 +279,22 @@ class YouTubePublisher:
             },
             timeout=30,
         )
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except requests.HTTPError:
+            try:
+                error_payload = response.json()
+            except ValueError:
+                error_payload = None
+            if (response.status_code == 400 and isinstance(error_payload, dict)
+                    and error_payload.get("error") == "invalid_grant"):
+                token["reauthorization_required"] = True
+                try:
+                    self._save_token(token)
+                except OSError:
+                    logger.warning("failed to persist YouTube reconnection status")
+                raise RuntimeError(self.REAUTHORIZATION_MESSAGE) from None
+            raise
         refreshed = response.json()
         if not refreshed.get("access_token"):
             raise RuntimeError("Google did not refresh the YouTube access token")

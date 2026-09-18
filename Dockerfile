@@ -15,7 +15,7 @@ ARG PIP_USE_OFFICIAL=1
 RUN set -u; \
     install_system_dependencies() { \
         apt-get update && \
-        apt-get install -y --no-install-recommends ca-certificates curl git ffmpeg; \
+        apt-get install -y --no-install-recommends ca-certificates curl git ffmpeg mesa-va-drivers; \
     }; \
     retry_system_dependencies() { \
         attempt=1; \

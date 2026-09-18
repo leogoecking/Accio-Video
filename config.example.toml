@@ -14,6 +14,10 @@ listen_port = 8080
 
 [app]
 
+# Edge TTS timeout in seconds per narration block (0 disables the timeout).
+# Long scripts are split into blocks of at most 1,000 characters automatically.
+edge_tts_timeout = 30
+
 # Optional protection for API routes and generated files under /tasks.
 # Leave empty for local backward-compatible access. When configured, clients
 # must send the same value in the x-api-key request header. Keep real keys only
@@ -281,9 +285,27 @@ subtitle_provider = "edge"
 
 # Leave unset to follow the app default (libx264). Hardware encoders are optional;
 # unsupported encoders automatically fall back to libx264.
-# Available values: "libx264", "h264_nvenc", "h264_amf", "h264_qsv",
+# Available values: "libx264", "h264_nvenc", "h264_amf", "h264_vaapi", "h264_qsv",
 # "h264_mf", "h264_videotoolbox".
 # video_codec = "libx264"
+# On Linux, VAAPI needs the render node in Docker and the Mesa VA driver.
+# The device defaults to renderD128; inspect /dev/dri before selecting another.
+video_vaapi_device = "/dev/dri/renderD128"
+# Lower QP preserves more detail but creates larger files. 18 is a balanced
+# starting point on the tested RX 6600; valid range is 1–51.
+video_vaapi_qp = 18
+# Compose subtitles and narration with FFmpeg and encode the final video on
+# VAAPI. Unsupported layouts (for example, watermark or BGM) use MoviePy.
+# Set false to compare quality/speed with the former CPU final render.
+video_vaapi_final_composition = true
+
+# Join compatible silent H.264 clips without another quality-reducing encode.
+# If probing, compatibility or output validation fails, retain transcoding.
+video_concat_stream_copy = true
+# Concurrent native FFmpeg clip renders shared by tasks/services in this storage.
+# 1 disables parallel preparation. Limited to 4 and the CPU/thread budget;
+# hardware encoding remains sequential.
+video_render_workers = 2
 
 # -----------------------------------------------------------------------------
 # Storage and Task Runtime / 存储与任务运行

@@ -8,9 +8,15 @@ import sys
 import re
 import shutil
 import tempfile
+import json
+import math
+import time
 import unicodedata
 from contextlib import ExitStack, redirect_stdout
+from contextvars import copy_context
 from functools import lru_cache
+from fractions import Fraction
+from concurrent.futures import ThreadPoolExecutor
 from typing import List
 from loguru import logger
 import numpy as np
@@ -39,6 +45,7 @@ from app.models.schema import (
 )
 from app.services import bgm as bgm_service
 from app.services.utils import ffmpeg_video, video_effects
+from app.services.utils.render_budget import native_render_slot
 from app.utils import file_security, utils
 
 class SubClippedVideoClip:
@@ -85,6 +92,7 @@ _MIN_DIMENSION_TOLERANCE = 10
 _DEFAULT_VIDEO_CODEC = "libx264"
 _SUPPORTED_VIDEO_CODECS = (
     "libx264",
+    "h264_vaapi",
     "h264_nvenc",
     "h264_amf",
     "h264_qsv",
@@ -248,7 +256,27 @@ def _get_effective_video_codec(preferred_codec: str | None = None) -> str:
         )
         return _DEFAULT_VIDEO_CODEC
 
+    if selected_codec == "h264_vaapi" and not _get_vaapi_device():
+        logger.warning("VAAPI render device is unavailable, fallback to libx264")
+        return _DEFAULT_VIDEO_CODEC
+
     return selected_codec
+
+
+def _get_vaapi_device() -> str | None:
+    """Accept only a Linux DRM render node exposed to this process."""
+    device = config.app.get("video_vaapi_device", "/dev/dri/renderD128")
+    if not isinstance(device, str) or not re.fullmatch(r"/dev/dri/renderD\d+", device):
+        return None
+    return device if os.path.exists(device) else None
+
+
+def _get_vaapi_qp() -> int:
+    try:
+        value = int(config.app.get("video_vaapi_qp", 18))
+    except (TypeError, ValueError):
+        return 18
+    return max(1, min(value, 51))
 
 
 def _disable_runtime_video_codec(codec: str, reason: str):
@@ -300,6 +328,10 @@ def _write_videofile_with_codec_fallback(clip, output_file: str, codec: str, **k
     生成任务不能因为高级编码器不可用而整体失败，所以这里把回退集中处理。
     """
     effective_codec = _get_effective_video_codec(codec)
+    if effective_codec == "h264_vaapi":
+        # MoviePy sends raw CPU frames to FFmpeg and cannot insert hwupload.
+        # Keep the final composition on CPU without disabling native VAAPI.
+        effective_codec = _DEFAULT_VIDEO_CODEC
     try:
         clip.write_videofile(output_file, codec=effective_codec, **kwargs)
         return effective_codec
@@ -332,6 +364,56 @@ def _format_ffmpeg_concat_path(file_path: str) -> str:
     return _escape_ffmpeg_concat_path(absolute_path.replace("\\", "/"))
 
 
+def _probe_concat_video(file_path: str):
+    """Optional ffprobe check; portable FFmpeg-only installs retain transcoding."""
+    ffmpeg_path = utils.get_ffmpeg_binary()
+    sibling = os.path.join(os.path.dirname(ffmpeg_path),
+                           "ffprobe.exe" if os.name == "nt" else "ffprobe")
+    prober = sibling if os.path.isfile(sibling) else shutil.which("ffprobe")
+    if not prober:
+        return None
+    try:
+        result = subprocess.run(
+            [prober, "-v", "error", "-show_streams", "-show_format", "-show_data",
+             "-of", "json", file_path],
+            capture_output=True, text=True, check=True, timeout=10,
+        )
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        if len(streams) != 1 or streams[0].get("codec_type") != "video":
+            return None
+        stream = streams[0]
+        if stream.get("codec_name") != "h264" or not stream.get("extradata"):
+            return None
+        fields = (
+            "codec_name", "profile", "level", "width", "height", "pix_fmt",
+            "sample_aspect_ratio", "r_frame_rate", "avg_frame_rate", "time_base",
+            "color_range", "color_space", "color_transfer", "color_primaries",
+            "chroma_location", "extradata",
+        )
+        duration = float(stream.get("duration") or data["format"]["duration"])
+        if duration <= 0 or abs(float(stream.get("start_time", 0))) > 0.001:
+            return None
+        return {
+            "signature": tuple(stream.get(field) for field in fields),
+            "fps": Fraction(stream["avg_frame_rate"]),
+            "duration": duration,
+        }
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError,
+            ZeroDivisionError):
+        return None
+
+
+def _can_stream_copy_concat(clip_files, fps):
+    metadata = {}
+    for clip_file in dict.fromkeys(clip_files):
+        info = _probe_concat_video(clip_file)
+        if info is None or (fps and info["fps"] != fps):
+            return False
+        metadata[clip_file] = info
+    return bool(metadata) and len({info["signature"] for info in metadata.values()}) == 1
+
+
 def concat_video_clips_with_ffmpeg(
     clip_files: List[str],
     output_file: str,
@@ -339,11 +421,13 @@ def concat_video_clips_with_ffmpeg(
     output_dir: str | None = None,
     max_duration: float | None = None,
     fps: int | None = None,
+    allow_stream_copy: bool = True,
 ):
     if not output_dir:
         output_dir = os.path.dirname(output_file) or "."
-    concat_list_file = os.path.join(output_dir, "ffmpeg-concat-list.txt")
-    with open(concat_list_file, "w", encoding="utf-8") as fp:
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=output_dir,
+                                     prefix="ffmpeg-concat-", suffix=".txt", delete=False) as fp:
+        concat_list_file = fp.name
         for clip_file in clip_files:
             fp.write(f"file '{_format_ffmpeg_concat_path(clip_file)}'\n")
 
@@ -351,20 +435,24 @@ def concat_video_clips_with_ffmpeg(
         command = [
             utils.get_ffmpeg_binary(),
             "-y",
+        ]
+        if codec == "h264_vaapi":
+            command.extend(["-vaapi_device", _get_vaapi_device()])
+        command.extend([
             "-f",
             "concat",
             "-safe",
             "0",
             "-i",
             concat_list_file,
-            "-c:v",
-            codec,
-            "-threads",
-            str(threads or 2),
-            "-pix_fmt",
-            "yuv420p",
-        ]
-        if fps is not None and fps > 0:
+            "-map", "0:v:0", "-an", "-c:v", codec,
+        ])
+        if codec == "h264_vaapi":
+            command.extend(["-vf", "format=nv12,hwupload", "-rc_mode", "CQP",
+                            "-qp", str(_get_vaapi_qp()), "-bf", "0"])
+        elif codec != "copy":
+            command.extend(["-threads", str(threads or 2), "-pix_fmt", "yuv420p"])
+        if codec != "copy" and fps is not None and fps > 0:
             command.extend(["-r", str(fps)])
         if max_duration is not None and max_duration > 0:
             command.extend(["-t", f"{max_duration:.3f}"])
@@ -387,6 +475,21 @@ def concat_video_clips_with_ffmpeg(
         return codec
 
     try:
+        if (allow_stream_copy and config.app.get("video_concat_stream_copy", True)
+                and _can_stream_copy_concat(clip_files, fps)):
+            try:
+                run_concat("copy")
+                output_info = _probe_concat_video(output_file)
+                # Packet copying can retain reordered frames beyond -t. Fall back
+                # when the result cannot meet the original frame-level duration.
+                if output_info is None:
+                    raise RuntimeError("could not validate stream-copy output")
+                if max_duration and abs(output_info["duration"] - max_duration) > 1 / float(output_info["fps"]):
+                    raise RuntimeError("stream-copy duration differs from narration")
+                logger.info("video clips joined without re-encoding")
+                return "copy"
+            except Exception as exc:
+                logger.info(f"stream-copy concat fallback to encoding: {exc}")
         effective_codec = _get_effective_video_codec()
         try:
             return run_concat(effective_codec)
@@ -398,6 +501,115 @@ def concat_video_clips_with_ffmpeg(
             return result_codec
     finally:
         delete_files(concat_list_file)
+
+
+def _get_video_render_workers(threads, codec):
+    try:
+        workers = int(config.app.get("video_render_workers", 2))
+    except (TypeError, ValueError):
+        workers = 2
+    # The benchmark used one hardware encoder. Keep one GPU job until
+    # concurrent GPU encodes have been measured on this device.
+    if codec != _DEFAULT_VIDEO_CODEC:
+        return 1
+    cpu_budget = max(1, (os.cpu_count() or 2) // max(1, threads or 2))
+    return max(1, min(workers, 4, cpu_budget))
+
+
+def _prepare_native_clips(items, output_dir, required_duration, max_clip_duration,
+                          clip_speed, transition, width, height, threads, fps):
+    """Parallelize independent FFmpeg renders; collect results in timeline order."""
+    codec = _get_effective_video_codec()
+    if codec != _DEFAULT_VIDEO_CODEC:
+        # Preserve incremental hardware fallback: the first failed GPU encode can
+        # disable that encoder before processing the remaining timeline clips.
+        return {}
+    workers = _get_video_render_workers(threads, codec)
+    jobs = []
+    planned_duration = 0
+    for index, item in enumerate(items):
+        if planned_duration >= required_duration:
+            break
+        source_duration = item.end_time - item.start_time
+        duration = min(source_duration / clip_speed, float(max_clip_duration))
+        planned_duration += duration
+        if not os.path.isfile(item.file_path):
+            continue
+        chosen_transition = transition
+        side = random.choice(["left", "right", "top", "bottom"])
+        if chosen_transition == VideoTransitionMode.shuffle.value:
+            chosen_transition = random.choice(["fadein", "fadeout", "slidein", "slideout", "zoomin", "zoomout"])
+        jobs.append((index, item, source_duration, duration, chosen_transition, side))
+
+    def render(job):
+        index, item, source_duration, duration, chosen_transition, side = job
+        output = os.path.join(output_dir, f"temp-clip-{index + 1}.mp4")
+        try:
+            rendered = _render_native_clip(
+                source_path=item.file_path, start_time=item.start_time,
+                source_duration=source_duration, output_path=output,
+                target_width=width, target_height=height, clip_speed=clip_speed,
+                transition_mode=chosen_transition, shuffle_side=side,
+                effective_duration=duration, codec=codec, threads=threads, fps=fps,
+            )
+            return index, rendered
+        except Exception as exc:
+            logger.debug(f"native clip preparation fallback: {exc}")
+            return index, False
+
+    started = time.monotonic()
+    contextual_jobs = [(copy_context(), job) for job in jobs]
+
+    def render_in_context(contextual_job):
+        context, job = contextual_job
+        return context.run(render, job)
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="video-clip") as executor:
+            results = dict(executor.map(render_in_context, contextual_jobs))
+    except BaseException:
+        # The executor has joined its workers before removing their outputs.
+        delete_files([os.path.join(output_dir, f"temp-clip-{job[0] + 1}.mp4") for job in jobs])
+        raise
+    if jobs:
+        logger.info(f"prepared {len(jobs)} clips with {workers} workers in {time.monotonic() - started:.2f}s")
+    return results
+
+
+def _render_native_clip(**kwargs):
+    if kwargs.get("codec") == "h264_vaapi":
+        kwargs = {**kwargs, "vaapi_device": _get_vaapi_device(),
+                  "vaapi_qp": _get_vaapi_qp()}
+    slots = _get_video_render_workers(kwargs.get("threads"), kwargs.get("codec"))
+    with native_render_slot(slots):
+        rendered = ffmpeg_video.render_subclip_with_ffmpeg(**kwargs)
+        if kwargs.get("codec") == "h264_vaapi" and not rendered:
+            fallback = ffmpeg_video.render_subclip_with_ffmpeg(
+                **{**kwargs, "codec": _DEFAULT_VIDEO_CODEC,
+                   "vaapi_device": None, "vaapi_qp": None}
+            )
+            if fallback:
+                _disable_runtime_video_codec("h264_vaapi", "native clip render failed")
+            return fallback
+        return rendered
+
+
+def _render_native_image(**kwargs):
+    if kwargs.get("codec") == "h264_vaapi":
+        kwargs = {**kwargs, "vaapi_device": _get_vaapi_device(),
+                  "vaapi_qp": _get_vaapi_qp()}
+    slots = _get_video_render_workers(kwargs.get("threads"), kwargs.get("codec"))
+    with native_render_slot(slots):
+        rendered = ffmpeg_video.render_image_to_video_with_ffmpeg(**kwargs)
+        if kwargs.get("codec") == "h264_vaapi" and not rendered:
+            fallback = ffmpeg_video.render_image_to_video_with_ffmpeg(
+                **{**kwargs, "codec": _DEFAULT_VIDEO_CODEC,
+                   "vaapi_device": None, "vaapi_qp": None}
+            )
+            if fallback:
+                _disable_runtime_video_codec("h264_vaapi", "native image render failed")
+            return fallback
+        return rendered
 
 
 def _sanitize_image_file(image_path: str) -> str:
@@ -646,7 +858,7 @@ def combine_videos(
                     )
 
                 try:
-                    rendered_with_ffmpeg = ffmpeg_video.render_subclip_with_ffmpeg(
+                    rendered_with_ffmpeg = _render_native_clip(
                         source_path=video_path,
                         start_time=0.0,
                         source_duration=source_dur,
@@ -760,183 +972,201 @@ def combine_videos(
     )
         
     logger.debug(f"total subclipped items: {len(subclipped_items)}")
-    
-    # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
-    for i, subclipped_item in enumerate(subclipped_items):
-        if video_duration >= required_video_duration:
-            break
-        
-        logger.debug(
-            f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, "
-            f"source: {os.path.basename(subclipped_item.source_file_path)}, "
-            f"current duration: {video_duration:.2f}s, "
-            f"remaining: {required_video_duration - video_duration:.2f}s"
+
+    temporary_paths = [
+        os.path.join(output_dir, f"temp-clip-{index + 1}.mp4")
+        for index in range(len(subclipped_items))
+    ]
+    try:
+        native_results = _prepare_native_clips(
+            subclipped_items, output_dir, required_video_duration, max_clip_duration,
+            normalized_clip_speed, transition_value, video_width, video_height, threads, fps,
         )
-        
-        shuffle_side = random.choice(["left", "right", "top", "bottom"])
-        clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
 
-        # 优先使用 FFmpeg Filtergraph Direct 进行原生快速切片、缩放、变速与转场
-        rendered_with_ffmpeg = False
-        source_dur = subclipped_item.end_time - subclipped_item.start_time
-        effective_dur = min(source_dur / normalized_clip_speed, float(max_clip_duration))
-
-        if os.path.isfile(subclipped_item.file_path):
-            chosen_transition = transition_value
-            if chosen_transition in ("shuffle", VideoTransitionMode.shuffle.value):
-                chosen_transition = random.choice(["fadein", "fadeout", "slidein", "slideout", "zoomin", "zoomout"])
-
-            try:
-                rendered_with_ffmpeg = ffmpeg_video.render_subclip_with_ffmpeg(
-                    source_path=subclipped_item.file_path,
-                    start_time=subclipped_item.start_time,
-                    source_duration=source_dur,
-                    output_path=clip_file,
-                    target_width=video_width,
-                    target_height=video_height,
-                    clip_speed=normalized_clip_speed,
-                    transition_mode=chosen_transition,
-                    shuffle_side=shuffle_side,
-                    effective_duration=effective_dur,
-                    codec=_get_effective_video_codec(),
-                    threads=threads,
-                    fps=fps,
-                )
-            except Exception as exc:
-                logger.debug(f"ffmpeg direct subclip render fallback: {exc}")
-                rendered_with_ffmpeg = False
-
-        if rendered_with_ffmpeg:
-            clip_duration_saved = effective_dur
-            processed_clips.append(
-                SubClippedVideoClip(
-                    file_path=clip_file,
-                    duration=clip_duration_saved,
-                    width=subclipped_item.width,
-                    height=subclipped_item.height,
-                    source_file_path=subclipped_item.source_file_path,
-                )
-            )
-            video_duration += clip_duration_saved
-            continue
-
-        try:
-            clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
-                subclipped_item.start_time, subclipped_item.end_time
-            )
-            # 播放速度属于素材本身属性，应在转场前应用。这样 Fade/Slide 等一秒转场
-            # 不会跟随素材速度变成 0.5 秒或 2 秒；后续最大时长裁剪继续作为
-            # 浮点误差或异常素材时长的安全兜底，保证最终片段不突破配置上限。
-            if normalized_clip_speed != 1.0:
-                clip = clip.with_speed_scaled(normalized_clip_speed)
-            clip_duration = clip.duration
-            # Not all videos are same size, so we need to resize them
-            clip_w, clip_h = clip.size
-            if clip_w != video_width or clip_h != video_height:
-                clip_ratio = clip.w / clip.h
-                video_ratio = video_width / video_height
-                logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
-                
-                if clip_ratio == video_ratio:
-                    clip = clip.resized(new_size=(video_width, video_height))
-                else:
-                    if clip_ratio > video_ratio:
-                        scale_factor = video_width / clip_w
-                    else:
-                        scale_factor = video_height / clip_h
-
-                    new_width = int(clip_w * scale_factor)
-                    new_height = int(clip_h * scale_factor)
-
-                    background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
-                    clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
-                    clip = CompositeVideoClip([background, clip_resized])
-                    
-            shuffle_side = random.choice(["left", "right", "top", "bottom"])
-            if transition_value in (None, VideoTransitionMode.none.value):
-                clip = clip
-            elif transition_value == VideoTransitionMode.fade_in.value:
-                clip = video_effects.fadein_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.fade_out.value:
-                clip = video_effects.fadeout_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.slide_in.value:
-                clip = video_effects.slidein_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.slide_out.value:
-                clip = video_effects.slideout_transition(clip, 1, shuffle_side)
-            elif transition_value == VideoTransitionMode.zoom_in.value:
-                clip = video_effects.zoomin_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.zoom_out.value:
-                clip = video_effects.zoomout_transition(clip, 1)
-            elif transition_value == VideoTransitionMode.shuffle.value:
-                transition_funcs = [
-                    lambda c: video_effects.fadein_transition(c, 1),
-                    lambda c: video_effects.fadeout_transition(c, 1),
-                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
-                    lambda c: video_effects.zoomin_transition(c, 1),
-                    lambda c: video_effects.zoomout_transition(c, 1),
-                ]
-                shuffle_transition = random.choice(transition_funcs)
-                clip = shuffle_transition(clip)
-
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
-                
-            # wirte clip to temp file
-            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
-            _write_videofile_with_codec_fallback(
-                clip,
-                clip_file,
-                codec=_get_configured_video_codec(),
-                logger=None,
-                fps=fps,
-            )
-
-            # Store clip duration before closing
-            clip_duration_saved = clip.duration
-            close_clip(clip)
-
-            processed_clips.append(
-                SubClippedVideoClip(
-                    file_path=clip_file,
-                    duration=clip_duration_saved,
-                    width=clip_w,
-                    height=clip_h,
-                    source_file_path=subclipped_item.source_file_path,
-                )
-            )
-            video_duration += clip_duration_saved
-            
-        except Exception as e:
-            logger.error(f"failed to process clip: {str(e)}")
-    
-    # loop processed clips until the video duration covers the audio duration and the small safety margin.
-    if video_duration < required_video_duration:
-        logger.warning(
-            f"video duration ({video_duration:.2f}s) is shorter than required duration "
-            f"({required_video_duration:.2f}s), looping clips to match audio length."
-        )
-        base_clips = processed_clips.copy()
-        for clip in itertools.cycle(base_clips):
+        # Add downloaded clips over and over until the duration of the audio (max_duration) has been reached
+        for i, subclipped_item in enumerate(subclipped_items):
             if video_duration >= required_video_duration:
                 break
-            processed_clips.append(clip)
-            video_duration += clip.duration
-        logger.info(
-            f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, "
-            f"required duration: {required_video_duration:.2f}s, "
-            f"looped {len(processed_clips)-len(base_clips)} clips"
-        )
-     
-    # merge video clips progressively, avoid loading all videos at once to avoid memory overflow
-    logger.info("starting clip merging process")
-    if not processed_clips:
-        logger.warning("no clips available for merging")
-        return combined_video_path
-    
-    clip_files = [clip.file_path for clip in processed_clips]
-    logger.info(f"concatenating {len(clip_files)} clips with ffmpeg")
-    try:
+
+            logger.debug(
+                f"processing clip {i+1}: {subclipped_item.width}x{subclipped_item.height}, "
+                f"source: {os.path.basename(subclipped_item.source_file_path)}, "
+                f"current duration: {video_duration:.2f}s, "
+                f"remaining: {required_video_duration - video_duration:.2f}s"
+            )
+
+            shuffle_side = random.choice(["left", "right", "top", "bottom"])
+            clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+
+            # 优先使用 FFmpeg Filtergraph Direct 进行原生快速切片、缩放、变速与转场
+            rendered_with_ffmpeg = native_results.get(i, False)
+            source_dur = subclipped_item.end_time - subclipped_item.start_time
+            effective_dur = min(source_dur / normalized_clip_speed, float(max_clip_duration))
+
+            if i not in native_results and os.path.isfile(subclipped_item.file_path):
+                chosen_transition = transition_value
+                if chosen_transition in ("shuffle", VideoTransitionMode.shuffle.value):
+                    chosen_transition = random.choice(["fadein", "fadeout", "slidein", "slideout", "zoomin", "zoomout"])
+
+                try:
+                    rendered_with_ffmpeg = _render_native_clip(
+                        source_path=subclipped_item.file_path,
+                        start_time=subclipped_item.start_time,
+                        source_duration=source_dur,
+                        output_path=clip_file,
+                        target_width=video_width,
+                        target_height=video_height,
+                        clip_speed=normalized_clip_speed,
+                        transition_mode=chosen_transition,
+                        shuffle_side=shuffle_side,
+                        effective_duration=effective_dur,
+                        codec=_get_effective_video_codec(),
+                        threads=threads,
+                        fps=fps,
+                    )
+                except Exception as exc:
+                    logger.debug(f"ffmpeg direct subclip render fallback: {exc}")
+                    rendered_with_ffmpeg = False
+
+            if rendered_with_ffmpeg:
+                clip_duration_saved = effective_dur
+                processed_clips.append(
+                    SubClippedVideoClip(
+                        file_path=clip_file,
+                        duration=clip_duration_saved,
+                        width=subclipped_item.width,
+                        height=subclipped_item.height,
+                        source_file_path=subclipped_item.source_file_path,
+                    )
+                )
+                video_duration += clip_duration_saved
+                continue
+
+            try:
+                clip = _open_video_clip_quietly(subclipped_item.file_path).subclipped(
+                    subclipped_item.start_time, subclipped_item.end_time
+                )
+                # 播放速度属于素材本身属性，应在转场前应用。这样 Fade/Slide 等一秒转场
+                # 不会跟随素材速度变成 0.5 秒或 2 秒；后续最大时长裁剪继续作为
+                # 浮点误差或异常素材时长的安全兜底，保证最终片段不突破配置上限。
+                if normalized_clip_speed != 1.0:
+                    clip = clip.with_speed_scaled(normalized_clip_speed)
+                clip_duration = clip.duration
+                # Not all videos are same size, so we need to resize them
+                clip_w, clip_h = clip.size
+                if clip_w != video_width or clip_h != video_height:
+                    clip_ratio = clip.w / clip.h
+                    video_ratio = video_width / video_height
+                    logger.debug(f"resizing clip, source: {clip_w}x{clip_h}, ratio: {clip_ratio:.2f}, target: {video_width}x{video_height}, ratio: {video_ratio:.2f}")
+
+                    if clip_ratio == video_ratio:
+                        clip = clip.resized(new_size=(video_width, video_height))
+                    else:
+                        if clip_ratio > video_ratio:
+                            scale_factor = video_width / clip_w
+                        else:
+                            scale_factor = video_height / clip_h
+
+                        new_width = int(clip_w * scale_factor)
+                        new_height = int(clip_h * scale_factor)
+
+                        background = ColorClip(size=(video_width, video_height), color=(0, 0, 0)).with_duration(clip_duration)
+                        clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
+                        clip = CompositeVideoClip([background, clip_resized])
+
+                shuffle_side = random.choice(["left", "right", "top", "bottom"])
+                if transition_value in (None, VideoTransitionMode.none.value):
+                    clip = clip
+                elif transition_value == VideoTransitionMode.fade_in.value:
+                    clip = video_effects.fadein_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.fade_out.value:
+                    clip = video_effects.fadeout_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.slide_in.value:
+                    clip = video_effects.slidein_transition(clip, 1, shuffle_side)
+                elif transition_value == VideoTransitionMode.slide_out.value:
+                    clip = video_effects.slideout_transition(clip, 1, shuffle_side)
+                elif transition_value == VideoTransitionMode.zoom_in.value:
+                    clip = video_effects.zoomin_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.zoom_out.value:
+                    clip = video_effects.zoomout_transition(clip, 1)
+                elif transition_value == VideoTransitionMode.shuffle.value:
+                    transition_funcs = [
+                        lambda c: video_effects.fadein_transition(c, 1),
+                        lambda c: video_effects.fadeout_transition(c, 1),
+                        lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
+                        lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
+                        lambda c: video_effects.zoomin_transition(c, 1),
+                        lambda c: video_effects.zoomout_transition(c, 1),
+                    ]
+                    shuffle_transition = random.choice(transition_funcs)
+                    clip = shuffle_transition(clip)
+
+                if clip.duration > max_clip_duration:
+                    clip = clip.subclipped(0, max_clip_duration)
+
+                # wirte clip to temp file
+                clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
+                _write_videofile_with_codec_fallback(
+                    clip,
+                    clip_file,
+                    codec=_get_configured_video_codec(),
+                    logger=None,
+                    fps=fps,
+                )
+
+                # Store clip duration before closing
+                clip_duration_saved = clip.duration
+                close_clip(clip)
+
+                processed_clips.append(
+                    SubClippedVideoClip(
+                        file_path=clip_file,
+                        duration=clip_duration_saved,
+                        width=clip_w,
+                        height=clip_h,
+                        source_file_path=subclipped_item.source_file_path,
+                    )
+                )
+                video_duration += clip_duration_saved
+
+            except Exception as e:
+                logger.error(f"failed to process clip: {str(e)}")
+
+        used_paths = {os.path.normcase(os.path.abspath(clip.file_path)) for clip in processed_clips}
+        unused_native_paths = [
+            os.path.join(output_dir, f"temp-clip-{index + 1}.mp4")
+            for index in native_results
+            if os.path.normcase(os.path.abspath(os.path.join(output_dir, f"temp-clip-{index + 1}.mp4"))) not in used_paths
+        ]
+        if unused_native_paths:
+            delete_files(unused_native_paths)
+
+        # loop processed clips until the video duration covers the audio duration and the small safety margin.
+        if video_duration < required_video_duration:
+            logger.warning(
+                f"video duration ({video_duration:.2f}s) is shorter than required duration "
+                f"({required_video_duration:.2f}s), looping clips to match audio length."
+            )
+            base_clips = processed_clips.copy()
+            for clip in itertools.cycle(base_clips):
+                if video_duration >= required_video_duration:
+                    break
+                processed_clips.append(clip)
+                video_duration += clip.duration
+            logger.info(
+                f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, "
+                f"required duration: {required_video_duration:.2f}s, "
+                f"looped {len(processed_clips)-len(base_clips)} clips"
+            )
+
+        # merge video clips progressively, avoid loading all videos at once to avoid memory overflow
+        logger.info("starting clip merging process")
+        if not processed_clips:
+            logger.warning("no clips available for merging")
+            return combined_video_path
+
+        clip_files = [clip.file_path for clip in processed_clips]
+        logger.info(f"concatenating {len(clip_files)} clips with ffmpeg")
         concat_video_clips_with_ffmpeg(
             clip_files=clip_files,
             output_file=combined_video_path,
@@ -947,9 +1177,9 @@ def combine_videos(
         )
         logger.info("video combining completed")
         return combined_video_path
+
     finally:
-        # clean temp files
-        delete_files(clip_files)
+        delete_files(temporary_paths)
 
 
 def wrap_text(text, max_width, font="Arial", fontsize=60):
@@ -1456,6 +1686,209 @@ def fit_clip_to_resolution(
     return CompositeVideoClip([background, resized_content])
 
 
+def _probe_stitch_media(file_path: str):
+    """Read stream parameters needed for a safe video-and-audio packet copy."""
+    ffmpeg_path = utils.get_ffmpeg_binary()
+    sibling = os.path.join(
+        os.path.dirname(ffmpeg_path), "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    )
+    prober = sibling if os.path.isfile(sibling) else shutil.which("ffprobe")
+    if not prober:
+        return None
+    try:
+        result = subprocess.run(
+            [prober, "-v", "error", "-show_streams", "-show_format", "-show_data",
+             "-of", "json", file_path],
+            capture_output=True, text=True, check=True, timeout=15,
+        )
+        streams = json.loads(result.stdout)["streams"]
+        if not streams or streams[0].get("codec_type") != "video":
+            return None
+        if len(streams) > 2 or (
+            len(streams) == 2 and streams[1].get("codec_type") != "audio"
+        ):
+            return None
+        video_stream = streams[0]
+        video_fields = (
+            "codec_name", "profile", "level", "width", "height", "pix_fmt",
+            "sample_aspect_ratio", "r_frame_rate", "time_base",
+            "color_range", "color_space", "color_transfer", "color_primaries",
+            "chroma_location", "extradata",
+        )
+        audio_stream = streams[1] if len(streams) == 2 else None
+        audio_fields = (
+            "codec_name", "profile", "sample_rate", "channels",
+            "channel_layout", "time_base", "extradata",
+        )
+        duration = float(video_stream["duration"])
+        frames = int(video_stream["nb_frames"])
+        frame_rate = Fraction(video_stream["avg_frame_rate"])
+        time_base = Fraction(video_stream["time_base"])
+        if duration <= 0 or frames <= 0 or frame_rate <= 0 or time_base.numerator != 1:
+            return None
+        return {
+            "video": video_stream,
+            "audio": audio_stream,
+            "video_signature": tuple(video_stream.get(field) for field in video_fields),
+            "audio_signature": (
+                tuple(audio_stream.get(field) for field in audio_fields)
+                if audio_stream else None
+            ),
+            "duration": duration,
+            "frames": frames,
+            "fps": frame_rate,
+            "video_timescale": time_base.denominator,
+        }
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError,
+            ZeroDivisionError):
+        return None
+
+
+def _stitch_intro_outro_stream_copy(
+    main_video_path: str,
+    output_file: str,
+    intro_path: str | None,
+    outro_path: str | None,
+    target_width: int,
+    target_height: int,
+    fps: int,
+) -> bool:
+    """Encode only short brand clips, then copy the finished main video unchanged."""
+    main = _probe_stitch_media(main_video_path)
+    if not main or not main["audio"]:
+        return False
+    main_video, main_audio = main["video"], main["audio"]
+    if (
+        main_video.get("codec_name") != "h264"
+        or main_video.get("pix_fmt") != "yuv420p"
+        or main_audio.get("codec_name") != "aac"
+        or not main_video.get("extradata")
+        or not main_audio.get("extradata")
+        or (main_video.get("width"), main_video.get("height"))
+        != (target_width, target_height)
+        or main["fps"] != Fraction(fps)
+    ):
+        return False
+    try:
+        sample_rate = int(main_audio["sample_rate"])
+        channels = int(main_audio["channels"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if sample_rate <= 0 or channels not in (1, 2):
+        return False
+    use_vaapi = "h264_vaapi" in str(main_video.get("tags", {}).get("encoder", ""))
+    vaapi_device = _get_vaapi_device() if use_vaapi else None
+    if use_vaapi and not vaapi_device:
+        return False
+
+    started = time.monotonic()
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+    with tempfile.TemporaryDirectory(prefix="stitch-", dir=output_dir) as work_dir:
+        segments = []
+        expected_frames = main["frames"]
+        expected_duration = main["duration"]
+        for name, source in (("intro", intro_path), ("main", main_video_path),
+                             ("outro", outro_path)):
+            if not source:
+                continue
+            if name == "main":
+                segments.append(source)
+                continue
+            source_info = _probe_stitch_media(source)
+            if not source_info:
+                return False
+            normalized = os.path.join(work_dir, f"{name}.mp4")
+            command = [utils.get_ffmpeg_binary(), "-hide_banner", "-loglevel", "error", "-y"]
+            if use_vaapi:
+                command.extend(["-vaapi_device", vaapi_device])
+            command.extend(["-i", source])
+            if not source_info["audio"]:
+                layout = "mono" if channels == 1 else "stereo"
+                command.extend([
+                    "-f", "lavfi", "-i",
+                    f"anullsrc=channel_layout={layout}:sample_rate={sample_rate}",
+                ])
+            video_filter = (
+                f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"fps={fps},format={'nv12,hwupload' if use_vaapi else 'yuv420p'}"
+            )
+            command.extend([
+                "-map", "0:v:0", "-map", "0:a:0" if source_info["audio"] else "1:a:0",
+                "-vf", video_filter,
+                "-c:v", "h264_vaapi" if use_vaapi else "libx264",
+            ])
+            if use_vaapi:
+                command.extend(["-rc_mode", "CQP", "-qp", str(_get_vaapi_qp()), "-bf", "0"])
+            else:
+                command.extend(["-preset", "medium", "-threads", "2", "-pix_fmt", "yuv420p"])
+            command.extend([
+                "-video_track_timescale", str(main["video_timescale"]),
+                "-c:a", "aac", "-ar", str(sample_rate), "-ac", str(channels),
+                "-af", "apad", "-t", f"{source_info['duration']:.6f}", normalized,
+            ])
+            with native_render_slot(_get_video_render_workers(
+                2, "h264_vaapi" if use_vaapi else _DEFAULT_VIDEO_CODEC
+            )):
+                rendered = subprocess.run(
+                    command, capture_output=True, text=True, check=False, timeout=600,
+                )
+            if rendered.returncode != 0:
+                logger.warning(
+                    f"fast {name} normalization failed; using MoviePy: "
+                    f"ffmpeg_exit_code={rendered.returncode}, "
+                    f"reason={_ffmpeg_failure_category(rendered.stderr)}"
+                )
+                return False
+            normalized_info = _probe_stitch_media(normalized)
+            if (
+                not normalized_info
+                or normalized_info["video_signature"] != main["video_signature"]
+                or normalized_info["audio_signature"] != main["audio_signature"]
+            ):
+                logger.info(f"fast {name} stream parameters differ; using MoviePy")
+                return False
+            segments.append(normalized)
+            expected_frames += normalized_info["frames"]
+            expected_duration += normalized_info["duration"]
+
+        concat_list = os.path.join(work_dir, "segments.txt")
+        with open(concat_list, "w", encoding="utf-8") as fp:
+            for segment in segments:
+                fp.write(f"file '{_format_ffmpeg_concat_path(segment)}'\n")
+        candidate = os.path.join(work_dir, "stitched.mp4")
+        joined = subprocess.run(
+            [utils.get_ffmpeg_binary(), "-hide_banner", "-loglevel", "error", "-y",
+             "-copyts", "-f", "concat", "-safe", "0", "-i", concat_list,
+             "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
+             "-movflags", "+faststart", candidate],
+            capture_output=True, text=True, check=False, timeout=600,
+        )
+        if joined.returncode != 0:
+            logger.warning(
+                "fast intro/outro stream copy failed; using MoviePy: "
+                f"ffmpeg_exit_code={joined.returncode}, "
+                f"reason={_ffmpeg_failure_category(joined.stderr)}"
+            )
+            return False
+        result = _probe_stitch_media(candidate)
+        if (
+            not result
+            or result["video_signature"] != main["video_signature"]
+            or result["audio_signature"] != main["audio_signature"]
+            or result["frames"] != expected_frames
+            or abs(result["duration"] - expected_duration) > 1 / float(main["fps"])
+        ):
+            logger.warning("fast intro/outro output validation failed; using MoviePy")
+            return False
+        os.replace(candidate, output_file)
+        logger.info(
+            f"stitched intro/outro without re-encoding the main video "
+            f"in {time.monotonic() - started:.2f}s"
+        )
+        return True
+
+
 def stitch_intro_outro(
     main_video_path: str,
     output_file: str,
@@ -1476,6 +1909,17 @@ def stitch_intro_outro(
         if main_video_path != output_file:
             shutil.copy2(main_video_path, output_file)
         return True
+
+    try:
+        if _stitch_intro_outro_stream_copy(
+            main_video_path, output_file,
+            intro_path if has_intro else None,
+            outro_path if has_outro else None,
+            target_width, target_height, fps,
+        ):
+            return True
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        logger.warning(f"fast intro/outro stitch failed; using MoviePy: {type(exc).__name__}")
 
     with ExitStack() as stack:
         clips_to_concat = []
@@ -1517,6 +1961,182 @@ def stitch_intro_outro(
         logger.info(
             f"stitched intro/outro: intro={has_intro}, outro={has_outro} => {output_file}"
         )
+        return True
+
+
+def _save_subtitle_overlay_image(
+    subtitle_item,
+    image_path: str,
+    width: int,
+    height: int,
+    create_text_clip,
+) -> None:
+    """Release each caption's image data before preparing the next caption."""
+    clip = create_text_clip(subtitle_item)
+    try:
+        with CompositeVideoClip([clip], size=(width, height), bg_color=None) as image_clip:
+            start, end = subtitle_item[0]
+            image_clip.save_frame(
+                image_path, t=(float(start) + float(end)) / 2,
+                with_mask=True,
+            )
+    finally:
+        clip.close()
+
+
+def _ffmpeg_failure_category(stderr: str) -> str:
+    """Classify expected FFmpeg errors without logging paths or media details."""
+    message = (stderr or "").lower()
+    categories = (
+        ("no space left on device", "disk_full"),
+        ("permission denied", "permission_denied"),
+        ("matches no streams", "missing_media_stream"),
+        ("no va display found", "vaapi_device_unavailable"),
+        ("device creation failed", "vaapi_device_unavailable"),
+        ("failed to create vaapi device", "vaapi_device_unavailable"),
+        ("failed to set value", "invalid_vaapi_device"),
+        ("no such filter", "filter_unavailable"),
+        ("error reinitializing filters", "filter_initialization_failed"),
+        ("error initializing output stream", "encoder_initialization_failed"),
+        ("no such file or directory", "missing_file"),
+    )
+    for marker, category in categories:
+        if marker in message:
+            return category
+    return "unclassified_ffmpeg_error"
+
+
+def _render_final_with_vaapi(
+    video_path: str,
+    audio_path: str,
+    subtitle_path: str,
+    output_file: str,
+    params: VideoParams,
+    width: int,
+    height: int,
+    create_text_clip,
+    make_textclip,
+) -> bool:
+    """Compose static subtitle cues in FFmpeg and encode the final video on VAAPI."""
+    if not config.app.get("video_vaapi_final_composition", True):
+        return False
+    if _get_effective_video_codec() != "h264_vaapi":
+        return False
+    if bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume):
+        return False
+    watermark_path = getattr(params, "watermark_path", "")
+    if watermark_path and os.path.isfile(watermark_path):
+        return False
+    if subtitle_path and os.path.isfile(subtitle_path) and not params.subtitle_enabled:
+        return False
+
+    source = _probe_stitch_media(video_path)
+    if not source or (
+        source["video"].get("width"), source["video"].get("height")
+    ) != (width, height) or source["fps"] != Fraction(fps):
+        return False
+
+    started = time.monotonic()
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+    with tempfile.TemporaryDirectory(prefix="final-vaapi-", dir=output_dir) as work_dir:
+        overlay_list = None
+        if subtitle_path and os.path.isfile(subtitle_path):
+            with ExitStack() as stack:
+                subtitles = stack.enter_context(SubtitlesClip(
+                    subtitles=subtitle_path,
+                    encoding="utf-8",
+                    make_textclip=make_textclip,
+                ))
+                blank = os.path.join(work_dir, "blank.png")
+                Image.new("RGBA", (width, height), (0, 0, 0, 0)).save(blank)
+                timeline = []
+                current_frame = 0
+                for index, item in enumerate(subtitles.subtitles):
+                    start, end = item[0]
+                    first = max(0, math.ceil(float(start) * fps - 1e-6))
+                    last = min(source["frames"], math.ceil(float(end) * fps - 1e-6))
+                    if last <= first:
+                        continue
+                    if first < current_frame:
+                        return False
+                    if first > current_frame:
+                        timeline.append((blank, (first - current_frame) / fps))
+                    image_path = os.path.join(work_dir, f"cue-{index:06d}.png")
+                    _save_subtitle_overlay_image(
+                        item, image_path, width, height, create_text_clip,
+                    )
+                    timeline.append((image_path, (last - first) / fps))
+                    current_frame = last
+                if current_frame < source["frames"]:
+                    timeline.append((blank, (source["frames"] - current_frame) / fps))
+                overlay_list = os.path.join(work_dir, "subtitles.ffconcat")
+                with open(overlay_list, "w", encoding="utf-8") as listing:
+                    listing.write("ffconcat version 1.0\n")
+                    for image_path, duration in timeline:
+                        listing.write(f"file '{_format_ffmpeg_concat_path(image_path)}'\n")
+                        listing.write("option framerate 1000\n")
+                        listing.write(f"duration {duration:.9f}\n")
+                    listing.write(f"file '{_format_ffmpeg_concat_path(blank)}'\n")
+                    listing.write("option framerate 1000\n")
+
+        candidate = os.path.join(work_dir, "final.mp4")
+        command = [utils.get_ffmpeg_binary(), "-hide_banner", "-loglevel", "error",
+                   "-y", "-vaapi_device", _get_vaapi_device(), "-i", video_path,
+                   "-i", audio_path]
+        if overlay_list:
+            command.extend(["-f", "concat", "-safe", "0", "-i", overlay_list])
+            video_filter = (
+                "[0:v][2:v]overlay=shortest=0:repeatlast=1:format=auto,"
+                "format=nv12,hwupload[v]"
+            )
+        else:
+            video_filter = "[0:v]format=nv12,hwupload[v]"
+        voice_volume = float(params.voice_volume)
+        if not math.isfinite(voice_volume):
+            return False
+        command.extend([
+            "-filter_complex", f"{video_filter};[1:a]volume={voice_volume},apad[a]",
+            "-map", "[v]", "-map", "[a]", "-frames:v", str(source["frames"]),
+            "-c:v", "h264_vaapi", "-rc_mode", "CQP", "-qp", str(_get_vaapi_qp()),
+            "-bf", "0", "-c:a", "aac", "-b:a", audio_bitrate,
+            "-ar", "44100", "-ac", "2",
+            "-t", f"{source['duration']:.6f}", "-movflags", "+faststart", candidate,
+        ])
+        with native_render_slot(_get_video_render_workers(2, "h264_vaapi")):
+            rendered = subprocess.run(command, capture_output=True, text=True, timeout=7200)
+        if rendered.returncode != 0:
+            logger.warning(
+                "VAAPI final composition failed; using MoviePy: "
+                f"ffmpeg_exit_code={rendered.returncode}, "
+                f"reason={_ffmpeg_failure_category(rendered.stderr)}"
+            )
+            return False
+        result = _probe_stitch_media(candidate)
+        validation_reason = None
+        if not result:
+            validation_reason = "probe_failed"
+        elif not result["audio"]:
+            validation_reason = "missing_audio"
+        elif result["video"].get("codec_name") != "h264":
+            validation_reason = "unexpected_video_codec"
+        elif result["frames"] != source["frames"]:
+            validation_reason = "frame_count_mismatch"
+        elif abs(result["duration"] - source["duration"]) > 1 / fps:
+            validation_reason = "video_duration_mismatch"
+        elif abs(float(result["video"].get("start_time", 0))) > 1 / fps:
+            validation_reason = "video_start_time_mismatch"
+        elif result["audio"].get("sample_rate") != "44100" or result["audio"].get("channels") != 2:
+            validation_reason = "unexpected_audio_format"
+        elif float(result["audio"].get("duration", 0)) < result["duration"] - 0.05:
+            validation_reason = "audio_too_short"
+        if validation_reason:
+            logger.warning(
+                "VAAPI final output validation failed; using MoviePy: "
+                f"reason={validation_reason}"
+            )
+            return False
+        os.replace(candidate, output_file)
+        logger.info(f"VAAPI final composition completed in {time.monotonic() - started:.2f}s")
         return True
 
 
@@ -1760,6 +2380,44 @@ def generate_video(
             _clip = _clip.with_position(("center", "center"))
         return _clip
 
+    def make_textclip(text):
+        return TextClip(
+            text=text,
+            font=font_path,
+            font_size=params.font_size,
+        )
+
+    intro_path = getattr(params, "intro_path", "")
+    outro_path = getattr(params, "outro_path", "")
+    has_intro = bool(intro_path and os.path.isfile(intro_path))
+    has_outro = bool(outro_path and os.path.isfile(outro_path))
+    fast_main_file = (
+        os.path.join(output_dir, f"temp-main-{os.path.basename(output_file)}")
+        if has_intro or has_outro else output_file
+    )
+    try:
+        if _render_final_with_vaapi(
+            video_path, audio_path, subtitle_path, fast_main_file, params,
+            video_width, video_height, create_text_clip, make_textclip,
+        ):
+            if has_intro or has_outro:
+                try:
+                    stitch_intro_outro(
+                        main_video_path=fast_main_file,
+                        output_file=output_file,
+                        intro_path=intro_path if has_intro else None,
+                        outro_path=outro_path if has_outro else None,
+                        target_width=video_width,
+                        target_height=video_height,
+                        fps=fps,
+                    )
+                finally:
+                    if os.path.exists(fast_main_file):
+                        os.remove(fast_main_file)
+            return True
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as exc:
+        logger.warning(f"VAAPI final composition unavailable; using MoviePy: {type(exc).__name__}")
+
     # MoviePy 的 CompositeAudioClip.close() 不会关闭子 AudioFileClip。这里用
     # ExitStack 显式持有所有原始文件 reader，确保成功、字幕异常、混音失败和
     # 视频写入失败等路径都能释放 FFmpeg 子进程，尤其避免 Windows 文件被占用。
@@ -1772,13 +2430,6 @@ def generate_video(
         audio_clip = voice_source_clip.with_effects(
             [afx.MultiplyVolume(params.voice_volume)]
         )
-
-        def make_textclip(text):
-            return TextClip(
-                text=text,
-                font=font_path,
-                font_size=params.font_size,
-            )
 
         watermark_clip = None
         watermark_path = getattr(params, "watermark_path", "")
@@ -1872,11 +2523,6 @@ def generate_video(
         # 显式沿用输入音频的采样率；如果取不到，再回退 MoviePy 默认的 44100Hz。
         # 这样可以减少不同环境，尤其 Docker 中再次重采样带来的音质波动。
         output_audio_fps = int(getattr(audio_clip, "fps", 0) or 44100)
-
-        intro_path = getattr(params, "intro_path", "")
-        outro_path = getattr(params, "outro_path", "")
-        has_intro = bool(intro_path and os.path.isfile(intro_path))
-        has_outro = bool(outro_path and os.path.isfile(outro_path))
 
         target_render_output = output_file
         temp_main_file = None
@@ -1988,13 +2634,13 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 # 优先使用 FFmpeg zoompan 滤镜直接生成动态缩放视频
                 rendered_with_ffmpeg = False
                 try:
-                    rendered_with_ffmpeg = ffmpeg_video.render_image_to_video_with_ffmpeg(
+                    rendered_with_ffmpeg = _render_native_image(
                         image_path=material_source_path,
                         output_path=video_file,
                         duration=clip_duration,
                         width=width,
                         height=height,
-                        codec=_get_configured_video_codec(),
+                        codec=_get_effective_video_codec(),
                         fps=fps,
                     )
                 except Exception as exc:

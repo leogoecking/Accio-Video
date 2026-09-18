@@ -3407,6 +3407,14 @@ def _render_social_publishing_settings(panel):
                 )
             )
 
+        if service.needs_reauthorization():
+            st.warning(
+                _publishing_text(
+                    "YouTube authorization expired or was revoked. Connect the account again below.",
+                    "A autorização do YouTube expirou ou foi revogada. Conecte a conta novamente abaixo.",
+                )
+            )
+
         if service.is_authorized():
             st.success(
                 _publishing_text(
@@ -5063,6 +5071,7 @@ def _render_video_settings(panel, params):
                 ("libx264 (CPU)", "libx264"),
                 ("NVIDIA NVENC (h264_nvenc)", "h264_nvenc"),
                 ("AMD AMF (h264_amf)", "h264_amf"),
+                ("AMD VAAPI Linux (h264_vaapi)", "h264_vaapi"),
                 ("Intel QSV (h264_qsv)", "h264_qsv"),
                 ("Windows MediaFoundation (h264_mf)", "h264_mf"),
                 ("macOS VideoToolbox (h264_videotoolbox)", "h264_videotoolbox"),

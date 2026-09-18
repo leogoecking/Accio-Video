@@ -53,6 +53,9 @@ class _FakeMoviePyClip:
 class TestVideoService(unittest.TestCase):
     def setUp(self):
         self.original_app_config = dict(config.app)
+        # These existing tests exercise the encoding path and mocked FFmpeg calls.
+        config.app["video_codec"] = "libx264"
+        config.app["video_concat_stream_copy"] = False
         self.test_img_path = os.path.join(resources_dir, "1.png")
         vd._runtime_disabled_video_codecs.clear()
         vd._ffmpeg_encoder_exists.cache_clear()

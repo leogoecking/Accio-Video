@@ -128,6 +128,40 @@ class TestYouTubePublisher(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["error"], "YouTube upload failed (Timeout)")
 
+    @patch("app.services.youtube_publisher.config.app")
+    @patch("app.services.youtube_publisher.requests.post")
+    def test_invalid_refresh_grant_requires_reconnection_without_exposing_token(
+        self, post, config_app
+    ):
+        config_app.get.side_effect = self.config.get
+        service, token_path_patch = self._service()
+        response = MagicMock(status_code=400)
+        response.json.return_value = {"error": "invalid_grant"}
+        response.raise_for_status.side_effect = requests.HTTPError("bad grant")
+        post.return_value = response
+
+        with token_path_patch:
+            service._save_token({"refresh_token": "private-refresh-token", "expires_at": 0})
+            with self.assertRaisesRegex(RuntimeError, "Reconnect the account") as error:
+                service._get_access_token()
+            self.assertTrue(service.needs_reauthorization())
+            self.assertFalse(service.is_authorized())
+            self.assertNotIn("private-refresh-token", str(error.exception))
+            self.assertEqual(post.call_count, 1)
+            with self.assertRaisesRegex(RuntimeError, "Reconnect the account"):
+                service._get_access_token()
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(os.stat(self.token_path).st_mode & 0o777, 0o600)
+
+            response.raise_for_status.side_effect = None
+            response.json.return_value = {
+                "access_token": "new-access", "refresh_token": "new-refresh",
+                "expires_in": 3600,
+            }
+            service.exchange_code("new-authorization-code")
+            self.assertTrue(service.is_authorized())
+            self.assertFalse(service.needs_reauthorization())
+
     @patch("app.services.youtube_publisher.logger.warning")
     @patch("app.services.youtube_publisher.config.app")
     @patch("app.services.youtube_publisher.requests.post")

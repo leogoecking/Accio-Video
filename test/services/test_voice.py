@@ -1,10 +1,12 @@
 import asyncio
 import base64
+import io
 import os
 import shutil
 import unittest
 import sys
 import tempfile
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -316,16 +318,8 @@ class TestVoiceService(unittest.TestCase):
             self.assertEqual(len(sub_maker.events), 1)
             self.assertEqual(sub_maker.events[0]["type"], "WordBoundary")
 
-    def test_azure_tts_v1_times_out_hanging_stream_sync(self):
-        """
-        验证 Azure TTS V1 在 edge_tts 同步流卡住时能够快速失败。
-
-        真实现场里，网络异常、服务端限流、voice 语言与文本不匹配时，
-        `stream_sync()` 可能长时间不返回，导致 WebUI 任务只停在
-        `start, voice name...`。这里用阻塞的 fake stream 复现该场景，
-        确认超时保护会让函数结束并返回 None。
-        """
-
+    def test_azure_tts_v1_cancels_hanging_stream_before_retry(self):
+        state = {"active": 0, "max_active": 0, "closed": 0}
         class _HangingCommunicate:
             def __init__(self, text, voice, rate="+0%", boundary=None):
                 self.text = text
@@ -334,8 +328,19 @@ class TestVoiceService(unittest.TestCase):
                 self.boundary = boundary
 
             def stream_sync(self):
-                time.sleep(10)
-                yield {"type": "audio", "data": b"unreachable"}
+                raise AssertionError("uncancellable stream_sync must not be used")
+
+            async def stream(self):
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+                try:
+                    yield {"type": "audio", "data": b"partial audio"}
+                    await asyncio.sleep(10)
+                finally:
+                    # Cleanup itself can await network/session closure.
+                    await asyncio.sleep(0.01)
+                    state["active"] -= 1
+                    state["closed"] += 1
 
         class _FakeSubMaker:
             def feed(self, chunk):
@@ -364,6 +369,189 @@ class TestVoiceService(unittest.TestCase):
 
         self.assertIsNone(sub_maker)
         self.assertLess(elapsed, 2)
+        self.assertEqual(state, {"active": 0, "max_active": 1, "closed": 3})
+        self.assertFalse(any(t.name == "edge-tts-stream" for t in threading.enumerate()))
+
+    def test_edge_tts_async_stream_works_inside_running_event_loop(self):
+        closed = []
+
+        class _Communicate:
+            def stream_sync(self):
+                raise AssertionError("stream_sync must not be used")
+
+            async def stream(self):
+                try:
+                    yield {"type": "audio", "data": b"complete audio"}
+                finally:
+                    closed.append(True)
+
+        async def _call():
+            events = []
+            vs.stream_edge_tts_chunks(_Communicate(), events.append, timeout_seconds=1)
+            return events
+
+        self.assertEqual(self.loop.run_until_complete(_call()),
+                         [{"type": "audio", "data": b"complete audio"}])
+        self.assertEqual(closed, [True])
+
+    def test_edge_tts_stream_closes_on_callback_failure(self):
+        closed = []
+
+        class _Communicate:
+            async def stream(self):
+                try:
+                    yield {"type": "audio", "data": b"audio"}
+                    await asyncio.sleep(10)
+                finally:
+                    closed.append(True)
+
+        def _fail(chunk):
+            raise OSError("simulated disk write failure")
+
+        with self.assertRaisesRegex(OSError, "disk write failure"):
+            vs.stream_edge_tts_chunks(_Communicate(), _fail, timeout_seconds=1)
+        self.assertEqual(closed, [True])
+        self.assertFalse(any(t.name == "edge-tts-stream" for t in threading.enumerate()))
+
+    def test_split_edge_tts_text_preserves_long_script_and_bounds_requests(self):
+        script = "\n\n".join(
+            " ".join(f"palavra{index}" for index in range(start, start + 100)) + "."
+            for start in range(0, 2800, 100)
+        )
+        blocks = vs.split_edge_tts_text(script)
+        self.assertGreater(len(blocks), 20)
+        self.assertTrue(all(0 < len(block) <= 1000 for block in blocks))
+        self.assertEqual(" ".join(blocks).split(), script.split())
+        self.assertEqual(vs.split_edge_tts_text("  "), [])
+        self.assertEqual(vs.split_edge_tts_text("Uma frase.\nOutra frase.", 15),
+                         ["Uma frase.", "Outra frase."])
+        unspaced = "文字" * 1100
+        self.assertEqual("".join(vs.split_edge_tts_text(unspaced)), unspaced)
+        with self.assertRaises(ValueError):
+            vs.split_edge_tts_text("texto", 0)
+
+    def _edge_tts_block_fixture(
+        self, fail_second=False, always_fail=False, script=None, duration_ms=2000
+    ):
+        """Real MP3 chunks with fake network events, including a partial retry."""
+        vs._configure_pydub_ffmpeg(AudioSegment)
+        buffer = io.BytesIO()
+        AudioSegment.silent(duration=duration_ms, frame_rate=24000).export(buffer, format="mp3")
+        audio_bytes = buffer.getvalue()
+        if script is None:
+            script = "\n\n".join(label * 90 for label in ("Primeiro ", "Segundo ", "Terceiro "))
+        blocks = vs.split_edge_tts_text(script)
+        calls = []
+
+        class _Communicate:
+            decoded_duration_ms = len(AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3"))
+
+            def __init__(self, text, voice, rate="+0%", boundary=None):
+                self.text = text
+                calls.append(text)
+
+            async def stream(self):
+                yield {"type": "audio", "data": audio_bytes}
+                yield {"type": "WordBoundary", "offset": 0, "duration": 10000000,
+                       "text": self.text}
+                if fail_second and self.text == blocks[1]:
+                    if always_fail or calls.count(self.text) == 1:
+                        raise TimeoutError("simulated interrupted narration block")
+
+        return script, blocks, calls, _Communicate
+
+    def test_long_edge_tts_retries_only_failed_block_and_offsets_subtitles(self):
+        script, blocks, calls, communicate = self._edge_tts_block_fixture(fail_second=True)
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.edge_tts, "Communicate", communicate
+        ):
+            output = Path(tmp_dir) / "audio.mp3"
+            result = vs.azure_tts_v1(script, "pt-BR-AntonioNeural-Male", 1.0, str(output))
+            self.assertIsNotNone(result)
+            self.assertEqual(calls, [blocks[0], blocks[1], blocks[1], blocks[2]])
+            self.assertEqual([cue.content for cue in result.cues], blocks)
+            self.assertEqual([cue.start.total_seconds() for cue in result.cues], [0, 2, 4])
+            self.assertEqual([cue.end.total_seconds() for cue in result.cues], [1, 3, 5])
+            self.assertEqual(vs.get_audio_duration(result), 6)
+            self.assertAlmostEqual(len(AudioSegment.from_file(output)) / 1000, 6, delta=0.1)
+            self.assertEqual(list(Path(tmp_dir).iterdir()), [output])
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            vs.create_subtitle(result, script, str(subtitle_file))
+            self.assertIn("00:00:04,000", subtitle_file.read_text(encoding="utf-8"))
+
+    def test_long_edge_tts_failure_does_not_publish_partial_audio(self):
+        for prior_audio in (None, b"previous complete audio"):
+            with self.subTest(prior_audio=prior_audio):
+                script, blocks, calls, communicate = self._edge_tts_block_fixture(
+                    fail_second=True, always_fail=True
+                )
+                with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+                    vs.edge_tts, "Communicate", communicate
+                ):
+                    output = Path(tmp_dir) / "audio.mp3"
+                    if prior_audio is not None:
+                        output.write_bytes(prior_audio)
+                    result = vs.azure_tts_v1(script, "pt-BR-AntonioNeural-Male", 1.0, str(output))
+                    self.assertIsNone(result)
+                    self.assertEqual(calls, [blocks[0], blocks[1], blocks[1], blocks[1]])
+                    if prior_audio is None:
+                        self.assertFalse(output.exists())
+                        self.assertEqual(list(Path(tmp_dir).iterdir()), [])
+                    else:
+                        self.assertEqual(output.read_bytes(), prior_audio)
+                        self.assertEqual(list(Path(tmp_dir).iterdir()), [output])
+
+    def test_long_edge_tts_works_with_configured_ffmpeg_without_ffprobe(self):
+        script, blocks, calls, communicate = self._edge_tts_block_fixture()
+        ffmpeg = vs.utils.get_ffmpeg_binary()
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.edge_tts, "Communicate", communicate
+        ), patch.dict(os.environ, {"PATH": tmp_dir, "IMAGEIO_FFMPEG_EXE": ffmpeg}), patch(
+            "pydub.audio_segment.mediainfo_json",
+            side_effect=AssertionError("ffprobe must not be needed"),
+        ):
+            output = Path(tmp_dir) / "audio.mp3"
+            self.assertIsNone(shutil.which("ffprobe"))
+            result = vs.azure_tts_v1(script, "pt-BR-AntonioNeural-Male", 1.0, str(output))
+            self.assertIsNotNone(result)
+            self.assertEqual(calls, blocks)
+            self.assertEqual(vs.get_audio_duration(result), 6)
+            self.assertEqual(len(vs._decode_edge_tts_block(str(output))), 6000)
+            self.assertEqual(list(Path(tmp_dir).iterdir()), [output])
+
+    def test_edge_tts_assembles_twenty_minute_audio_without_external_requests(self):
+        script = " ".join(["narração"] * 2800)
+        duration_ms = 1200000 // len(vs.split_edge_tts_text(script))
+        script, blocks, calls, communicate = self._edge_tts_block_fixture(
+            script=script, duration_ms=duration_ms
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.edge_tts, "Communicate", communicate
+        ):
+            output = Path(tmp_dir) / "audio.mp3"
+            result = vs.azure_tts_v1(script, "pt-BR-AntonioNeural-Male", 1.0, str(output))
+            self.assertIsNotNone(result)
+            self.assertEqual(calls, blocks)
+            self.assertEqual(" ".join(cue.content for cue in result.cues).split(), script.split())
+            duration = len(AudioSegment.from_file(output)) / 1000
+            self.assertAlmostEqual(duration, 1200, delta=0.1)
+            self.assertAlmostEqual(vs.get_audio_duration(result), duration, delta=0.1)
+            for index, cue in enumerate(result.cues):
+                self.assertAlmostEqual(cue.start.total_seconds(),
+                                       index * communicate.decoded_duration_ms / 1000,
+                                       delta=0.01)
+            self.assertEqual(list(Path(tmp_dir).iterdir()), [output])
+
+    def test_long_edge_tts_export_failure_preserves_previous_audio(self):
+        script, _, _, communicate = self._edge_tts_block_fixture()
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs.edge_tts, "Communicate", communicate
+        ), patch.object(AudioSegment, "export", side_effect=OSError("simulated encoding failure")):
+            output = Path(tmp_dir) / "audio.mp3"
+            output.write_bytes(b"previous complete audio")
+            self.assertIsNone(vs.azure_tts_v1(script, "pt-BR-AntonioNeural-Male", 1.0, str(output)))
+            self.assertEqual(output.read_bytes(), b"previous complete audio")
+            self.assertEqual(list(Path(tmp_dir).iterdir()), [output])
 
     @unittest.skipUnless(
         RUN_INTEGRATION_TESTS,

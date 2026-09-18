@@ -5,6 +5,7 @@ import threading
 import time
 from collections.abc import Mapping
 from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -14,7 +15,7 @@ from loguru import logger
 
 from app.models import const
 from app.models.schema import VideoParams
-from app.services import webui_task
+from app.services import video, webui_task
 from app.utils import logging_utils
 
 
@@ -346,6 +347,45 @@ def test_worker_logs_are_available_without_streamlit_session_state():
         r"- unique background task log",
         records[0],
     )
+
+
+def test_parallel_native_logs_keep_task_context_without_mixing_tasks(tmp_path, monkeypatch):
+    task_ids = ("native-log-task-a", "native-log-task-b")
+    barrier = threading.Barrier(3, timeout=5)
+    monkeypatch.setitem(video.config.app, "video_render_workers", 2)
+    source = tmp_path / "source.mp4"
+    source.touch()
+
+    def render(**kwargs):
+        task_id = Path(kwargs["output_path"]).parent.name
+        logger.error(f"native diagnostic for {task_id}")
+        raise RuntimeError(f"native failure for {task_id}")
+
+    def start(task_id, **kwargs):
+        directory = tmp_path / task_id
+        directory.mkdir()
+        barrier.wait()
+        items = [video.SubClippedVideoClip(str(source), start_time=0, end_time=1)]
+        result = video._prepare_native_clips(items, str(directory), 1, 1, 1, None, 240, 320, 2, 30)
+        assert result == {0: False}
+        return {"task_id": task_id}
+
+    with patch.object(webui_task.tm, "start", side_effect=start), patch.object(
+        webui_task.config, "runtime_config_lock", return_value=nullcontext()
+    ), patch.object(video, "_get_effective_video_codec", return_value="libx264"), patch.object(
+        video.ffmpeg_video, "render_subclip_with_ffmpeg", side_effect=render
+    ), patch.object(video, "native_render_slot", side_effect=lambda *args: nullcontext()), ThreadPoolExecutor(2) as pool:
+        futures = [pool.submit(webui_task._run_generation, task_id, VideoParams(), True) for task_id in task_ids]
+        barrier.wait()
+        logger.error("unrelated main thread log")
+        assert [future.result(timeout=5) for future in futures] == [{"task_id": task_id} for task_id in task_ids]
+
+    for task_id in task_ids:
+        logs = "\n".join(webui_task.get_task_logs(task_id))
+        assert f"native diagnostic for {task_id}" in logs
+        assert f"native failure for {task_id}" in logs
+        assert task_ids[1 - task_ids.index(task_id)] not in logs
+        assert "unrelated main thread log" not in logs
 
 
 def test_generation_log_fragment_refreshes_within_half_a_second():

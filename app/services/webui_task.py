@@ -63,64 +63,64 @@ def _run_generation(
     """
     在后台线程中执行现有视频流水线。
 
-    Loguru 的 sink 是进程级资源，因此必须按当前工作线程过滤。否则同时运行的
-    API 任务或其它页面日志会混入当前任务。页面只读取普通列表快照，不会从后台
+    Loguru 的 sink 是进程级资源，因此按任务上下文过滤，包括视频准备线程。
+    这样其它任务或页面日志不会混入当前任务。页面只读取普通列表快照，不会从后台
     线程访问 Streamlit session_state，从根源上避免刷新时的 delta 路径错乱。
     """
     log_handler_id = None
-    worker_thread_id = threading.get_ident()
-    try:
-        if capture_logs:
-            log_handler_id = logger.add(
-                lambda message: _append_task_log(task_id, str(message)),
-                level="DEBUG",
-                format=format_log_record,
-                colorize=False,
-                diagnose=False,
-                filter=lambda record: record["thread"].id == worker_thread_id,
-            )
-
-        # 完整任务仍使用原来的配置锁，防止另一个 WebUI 会话在生成中途修改
-        # Provider、密钥等进程级配置，造成同一条视频前后使用不同设置。
-        with config.runtime_config_lock():
-            return tm.start(
-                task_id=task_id,
-                params=params,
-                voice_preview=voice_preview,
-                loomloom_video_request=loomloom_video_request,
-            )
-    except Exception as exc:
-        # tm.start 已负责把流水线异常转换成失败状态；这里额外保护日志 sink、
-        # 配置锁等 WebUI 包装层。任何后台线程异常都必须留下终态，不能让任务
-        # 管理器在工作线程退出后仍永久显示“生成中”。
-        error = f"{type(exc).__name__}: {exc}"
-        failure = {
-            "task_id": task_id,
-            "state": const.TASK_STATE_FAILED,
-            "progress": 0,
-            "failed_stage": "webui_worker",
-            "error": error,
-        }
-        sm.state.update_task(
-            task_id,
-            state=failure["state"],
-            progress=failure["progress"],
-            failed_stage=failure["failed_stage"],
-            error=failure["error"],
-        )
-        logger.exception(
-            f"unexpected WebUI generation worker failure, "
-            f"task_id={task_id}, error={exc}"
-        )
-        return failure
-    finally:
-        if log_handler_id is not None:
-            try:
-                logger.remove(log_handler_id)
-            except ValueError:
-                logger.debug(
-                    f"WebUI task log handler already removed: task_id={task_id}"
+    with logger.contextualize(video_task_id=task_id):
+        try:
+            if capture_logs:
+                log_handler_id = logger.add(
+                    lambda message: _append_task_log(task_id, str(message)),
+                    level="DEBUG",
+                    format=format_log_record,
+                    colorize=False,
+                    diagnose=False,
+                    filter=lambda record: record["extra"].get("video_task_id") == task_id,
                 )
+
+            # 完整任务仍使用原来的配置锁，防止另一个 WebUI 会话在生成中途修改
+            # Provider、密钥等进程级配置，造成同一条视频前后使用不同设置。
+            with config.runtime_config_lock():
+                return tm.start(
+                    task_id=task_id,
+                    params=params,
+                    voice_preview=voice_preview,
+                    loomloom_video_request=loomloom_video_request,
+                )
+        except Exception as exc:
+            # tm.start 已负责把流水线异常转换成失败状态；这里额外保护日志 sink、
+            # 配置锁等 WebUI 包装层。任何后台线程异常都必须留下终态，不能让任务
+            # 管理器在工作线程退出后仍永久显示“生成中”。
+            error = f"{type(exc).__name__}: {exc}"
+            failure = {
+                "task_id": task_id,
+                "state": const.TASK_STATE_FAILED,
+                "progress": 0,
+                "failed_stage": "webui_worker",
+                "error": error,
+            }
+            sm.state.update_task(
+                task_id,
+                state=failure["state"],
+                progress=failure["progress"],
+                failed_stage=failure["failed_stage"],
+                error=failure["error"],
+            )
+            logger.exception(
+                f"unexpected WebUI generation worker failure, "
+                f"task_id={task_id}, error={exc}"
+            )
+            return failure
+        finally:
+            if log_handler_id is not None:
+                try:
+                    logger.remove(log_handler_id)
+                except ValueError:
+                    logger.debug(
+                        f"WebUI task log handler already removed: task_id={task_id}"
+                    )
 
 
 def submit_generation(

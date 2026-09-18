@@ -5,12 +5,10 @@ import inspect
 import json
 import math
 import os
-import queue
 import re
 import subprocess
 import tempfile
 import threading
-import time
 import unicodedata
 from datetime import datetime
 from typing import Union
@@ -29,6 +27,7 @@ from app.config import config
 from app.utils import utils
 
 _DEFAULT_EDGE_TTS_TIMEOUT_SECONDS = 30.0
+_EDGE_TTS_BLOCK_MAX_CHARS = 1000
 _MIMO_DEFAULT_BASE_URL = "https://api.xiaomimimo.com/v1"
 _MIMO_DEFAULT_TTS_MODEL = "mimo-v2.5-tts"
 MINIMAX_TTS_GLOBAL_URL = "https://api.minimax.io/v1/t2a_v2"
@@ -707,7 +706,7 @@ def get_edge_tts_timeout_seconds() -> Union[float, None]:
     默认超时，避免 WebUI 任务长期无反馈。
 
     使用方式：
-    - 默认 30 秒，覆盖常见短视频脚本的首包等待时间；
+    - 默认每个文本块总超时 30 秒；长脚本分块处理，而非限制整个音频时长；
     - 如用户处于慢网络或代理环境，可在 `config.toml` 里设置
       `edge_tts_timeout = 60`；
     - 设置为 0 或负数表示显式禁用超时，保留完全向后兼容。
@@ -730,122 +729,113 @@ def get_edge_tts_timeout_seconds() -> Union[float, None]:
     return timeout_seconds
 
 
-def _stream_edge_tts_sync_with_timeout(
-    communicate, on_chunk, timeout_seconds: float
-) -> None:
-    """
-    带总超时地消费 edge_tts 7.x 的同步流。
-
-    实现原因：
-    `stream_sync()` 本身是阻塞迭代器，网络层卡住时主线程无法及时恢复。
-    这里把阻塞迭代放到 daemon 线程中，主线程通过 Queue 获取 chunk，
-    到达超时时间后直接抛出 TimeoutError，让外层重试和错误日志继续工作。
-
-    注意：
-    daemon 线程只作为兜底保护使用，最多随 Azure TTS V1 的 3 次重试产生
-    少量残留线程；进程退出时会自动回收。相比 WebUI 任务永久卡住，这是
-    更可控的失败模式。
-    """
-    stream_queue = queue.Queue()
-    done_marker = object()
-
-    def _produce_chunks():
-        try:
-            for chunk in communicate.stream_sync():
-                stream_queue.put(("chunk", chunk))
-            stream_queue.put(("done", done_marker))
-        except Exception as e:
-            stream_queue.put(("error", e))
-
-    thread = threading.Thread(target=_produce_chunks, daemon=True)
-    thread.start()
-
-    deadline = time.monotonic() + timeout_seconds
-    while True:
-        remaining_seconds = deadline - time.monotonic()
-        if remaining_seconds <= 0:
-            raise TimeoutError(
-                f"edge_tts stream timed out after {timeout_seconds:g}s"
-            )
-
-        try:
-            item_type, payload = stream_queue.get(
-                timeout=min(0.5, remaining_seconds)
-            )
-        except queue.Empty:
-            continue
-
-        if item_type == "chunk":
-            on_chunk(payload)
-        elif item_type == "error":
-            raise payload
-        elif item_type == "done":
-            return
-
-
 def stream_edge_tts_chunks(
     communicate, on_chunk, timeout_seconds: Union[float, None] = None
 ) -> None:
+    """Consume cancellable async streams, closing each request before retrying.
+
+    Both current and legacy Edge TTS expose stream(). Avoid stream_sync(), whose
+    internal executor keeps working after a caller-side timeout. An owned worker
+    also allows synchronous callers inside an already running asyncio loop.
     """
-    统一消费 edge_tts 的同步流和旧版异步流。
-
-    edge_tts 7.x 提供 `stream_sync()`，可以在同步函数里直接迭代；
-    更早的版本通常只有异步 `stream()`。为了让 `azure_tts_v1()` 在
-    旧依赖残留场景下仍能继续工作，这里统一做一层流式兼容。
-
-    Args:
-        communicate: edge_tts.Communicate 实例
-        on_chunk: 每拿到一个事件块时执行的回调
-        timeout_seconds: 单次流式请求总超时；为 None 时不启用超时。
-    """
-    if hasattr(communicate, "stream_sync"):
-        if timeout_seconds:
-            _stream_edge_tts_sync_with_timeout(
-                communicate, on_chunk, timeout_seconds
-            )
-            return
-
-        for chunk in communicate.stream_sync():
-            on_chunk(chunk)
-        return
-
     if not hasattr(communicate, "stream"):
-        raise AttributeError("edge_tts communicate object has no stream method")
+        if hasattr(communicate, "stream_sync") and timeout_seconds is None:
+            for chunk in communicate.stream_sync():
+                on_chunk(chunk)
+            return
+        raise AttributeError("timed edge_tts streaming requires an async stream method")
 
     async def _consume_async_stream():
-        async for chunk in communicate.stream():
-            on_chunk(chunk)
+        stream = communicate.stream()
+        try:
+            async for chunk in stream:
+                on_chunk(chunk)
+        finally:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
 
-    # 这里显式创建独立事件循环，而不是复用外部上下文，目的是避免
-    # 在同步调用栈里遇到“当前线程没有事件循环”或跨线程复用循环的问题。
-    loop = asyncio.new_event_loop()
-    try:
+    async def _run():
         if timeout_seconds:
-            loop.run_until_complete(
-                asyncio.wait_for(_consume_async_stream(), timeout=timeout_seconds)
-            )
+            try:
+                await asyncio.wait_for(_consume_async_stream(), timeout=timeout_seconds)
+            except asyncio.TimeoutError as e:
+                raise TimeoutError(
+                    f"edge_tts stream timed out after {timeout_seconds:g}s"
+                ) from e
         else:
-            loop.run_until_complete(_consume_async_stream())
+            await _consume_async_stream()
+
+    errors = []
+
+    def _worker():
+        try:
+            asyncio.run(_run())
+        except BaseException as e:
+            errors.append(e)
+
+    worker = threading.Thread(target=_worker, name="edge-tts-stream")
+    worker.start()
+    # wait_for completes cancellation and async-generator cleanup before the
+    # worker exits. Never abandon a live worker when the request times out.
+    worker.join()
+    if errors:
+        raise errors[0]
+
+
+def _decode_edge_tts_block(audio_file):
+    """Decode with the configured FFmpeg; PCM WAV reading needs no ffprobe."""
+    from pydub import AudioSegment
+
+    wav_file = f"{audio_file}.wav"
+    try:
+        subprocess.run(
+            [utils.get_ffmpeg_binary(), "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-y", "-i", audio_file, "-vn", "-acodec", "pcm_s16le", "-f", "wav", wav_file],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+        return AudioSegment.from_wav(wav_file)
     finally:
-        loop.close()
+        if os.path.exists(wav_file):
+            os.remove(wav_file)
 
 
-def azure_tts_v1(
-    text: str, voice_name: str, voice_rate: float, voice_file: str
-) -> Union[SubMaker, None]:
-    voice_name = parse_voice_name(voice_name)
-    text = text.strip()
-    rate_str = convert_rate_to_percent(voice_rate)
+def split_edge_tts_text(text: str, max_chars: int = _EDGE_TTS_BLOCK_MAX_CHARS) -> list[str]:
+    """Bound requests while preferring paragraph, sentence and word boundaries."""
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
+    remaining = text.strip()
+    blocks = []
+    while len(remaining) > max_chars:
+        window = remaining[:max_chars + 1]
+        boundaries = list(re.finditer(r'[.!?。！？]["”’]?\s+|\n+', window))
+        cut = boundaries[-1].end() if boundaries else 0
+        if cut < max_chars // 2 or cut > max_chars:
+            spaces = list(re.finditer(r"\s+", window[:max_chars]))
+            cut = spaces[-1].end() if spaces else max_chars
+        block = remaining[:cut].strip()
+        if block:
+            blocks.append(block)
+        remaining = remaining[cut:].strip()
+    if remaining:
+        blocks.append(remaining)
+    return blocks
+
+
+def _synthesize_edge_tts_block(text, voice_name, rate_str, voice_file):
+    """Retry only this block; callers keep all intermediate files private."""
     for i in range(3):
         try:
             logger.info(f"start, voice name: {voice_name}, try: {i + 1}")
 
-            # 这里同时兼容 edge_tts 7.x 和旧版便携包里可能残留的老依赖：
-            # 1. 新版支持 `boundary` + `stream_sync()`
-            # 2. 旧版不支持 `boundary`，且通常只暴露异步 `stream()`
+            # Keep boundary construction compatible with current and legacy TTS.
             ensure_file_path_exists(voice_file)
             communicate = create_edge_tts_communicate(text, voice_name, rate_str)
             sub_maker = edge_tts.SubMaker()
+            boundaries = []
             timeout_seconds = get_edge_tts_timeout_seconds()
 
             with open(voice_file, "wb") as file:
@@ -858,31 +848,88 @@ def azure_tts_v1(
                         # 里仍有边界信息，就统一喂给 SubMaker，保证后续字幕链路
                         # 仍然走项目现有逻辑。
                         sub_maker.feed(chunk)
+                        boundaries.append(dict(chunk))
 
                 stream_edge_tts_chunks(
                     communicate, _handle_chunk, timeout_seconds=timeout_seconds
                 )
 
-            if not sub_maker.get_srt():
-                logger.warning("failed, sub_maker.get_srt() is empty")
+            if not sub_maker.get_srt() or os.path.getsize(voice_file) == 0:
+                logger.warning("failed, audio or subtitle timeline is empty")
                 continue
 
             logger.info(f"completed, output file: {voice_file}")
-            return sub_maker
+            return sub_maker, boundaries
         except Exception as e:
             logger.error(f"failed, error: {str(e)}")
-            # TTS 流式写入如果在首包前超时或网络异常，会留下 0 字节音频文件。
-            # 这种文件既不可播放，也可能误导后续排查，因此失败后只清理空文件；
-            # 如果已经写入了部分数据，则保留现场文件，便于分析服务端返回内容。
-            if os.path.exists(voice_file) and os.path.getsize(voice_file) == 0:
+            if os.path.exists(voice_file):
                 try:
                     os.remove(voice_file)
                 except Exception as remove_error:
                     logger.warning(
-                        "failed to remove empty tts file: "
+                        "failed to remove incomplete tts block: "
                         f"{voice_file}, error: {str(remove_error)}"
                     )
     return None
+
+
+def azure_tts_v1(
+    text: str, voice_name: str, voice_rate: float, voice_file: str
+) -> Union[SubMaker, None]:
+    """Synthesize bounded blocks and publish audio only after complete success."""
+    blocks = split_edge_tts_text(text)
+    if not blocks:
+        return None
+    voice_name = parse_voice_name(voice_name)
+    rate_str = convert_rate_to_percent(voice_rate)
+    ensure_file_path_exists(voice_file)
+    try:
+        # Keep intermediates on the destination filesystem for an atomic replace.
+        with tempfile.TemporaryDirectory(
+            prefix=".edge-tts-", dir=os.path.dirname(os.path.abspath(voice_file))
+        ) as temp_dir:
+            if len(blocks) == 1:
+                block_file = os.path.join(temp_dir, "audio.mp3")
+                result = _synthesize_edge_tts_block(
+                    blocks[0], voice_name, rate_str, block_file
+                )
+                if result is None:
+                    return None
+                os.replace(block_file, voice_file)
+                return result[0]
+
+            from pydub import AudioSegment
+
+            _configure_pydub_ffmpeg(AudioSegment)
+            sub_maker = edge_tts.SubMaker()
+            combined = None
+            for index, block in enumerate(blocks):
+                logger.info(f"synthesizing narration block {index + 1}/{len(blocks)}")
+                block_file = os.path.join(temp_dir, f"block-{index}.mp3")
+                result = _synthesize_edge_tts_block(
+                    block, voice_name, rate_str, block_file
+                )
+                if result is None:
+                    return None
+                segment = _decode_edge_tts_block(block_file)
+                if len(segment) == 0:
+                    raise ValueError("generated narration block has zero duration")
+                offset = 0 if combined is None else len(combined) * 10000
+                for boundary in result[1]:
+                    sub_maker.feed({**boundary, "offset": boundary["offset"] + offset})
+                combined = segment if combined is None else combined + segment
+                os.remove(block_file)
+
+            final_file = os.path.join(temp_dir, "audio.mp3")
+            combined.export(final_file, format="mp3", bitrate="128k").close()
+            # The last word boundary excludes trailing audio. Preserve the complete
+            # duration so video assembly does not truncate the end of the narration.
+            sub_maker.audio_duration_seconds = len(combined) / 1000
+            os.replace(final_file, voice_file)
+            return sub_maker
+    except Exception as e:
+        logger.error(f"failed to assemble edge tts narration: {str(e)}")
+        return None
 
 
 def siliconflow_tts(
@@ -2239,6 +2286,9 @@ def _get_audio_duration_from_submaker(sub_maker: SubMaker):
     """
     获取音频时长
     """
+    complete_duration = getattr(sub_maker, "audio_duration_seconds", None)
+    if complete_duration is not None:
+        return complete_duration
     # 优先兼容 edge_tts 7.x 的 cues 结构；
     # 如果是项目里其他 TTS 手工填充的旧结构，则继续读取 offset。
     if hasattr(sub_maker, "cues") and sub_maker.cues:

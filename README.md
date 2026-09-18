@@ -54,7 +54,7 @@ Basta fornecer um **tema** ou **palavra-chave**, e o **Accio Video** gera automa
 | :--- | :--- | :--- |
 | **CPU** | 4 núcleos | 6 a 8 núcleos |
 | **RAM** | 4 GB | 8 GB a 16 GB |
-| **GPU** | Opcional | Recomendado para transcrever com Whisper ou aceleração NVENC |
+| **GPU** | Opcional | Recomendado para transcrever com Whisper ou acelerar a renderização com NVENC/VAAPI |
 
 ---
 
@@ -104,6 +104,18 @@ Documentação interativa disponível em: `http://127.0.0.1:8080/docs`
 ```bash
 docker compose up -d
 ```
+
+### Renderização com GPU AMD no Linux
+
+Com uma GPU AMD acessível em `/dev/dri/renderD128`, configure `video_codec = "h264_vaapi"` e `video_vaapi_device = "/dev/dri/renderD128"` na seção `[app]` de `config.toml`. `video_vaapi_qp = 18` controla a qualidade: valores menores geram arquivos maiores e preservam mais detalhes.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.amd.yml up -d --build
+```
+
+Esse modo acelera a preparação dos clipes e imagens. A composição final de legendas e narração também usa FFmpeg e VAAPI quando não há música de fundo nem marca-d'água; a intro e a outro são normalizadas para permitir junção sem recodificar o vídeo principal. Combinações ainda não cobertas ou falhas na rota VAAPI usam MoviePy em CPU. Para comparar qualidade e tempo com o fluxo anterior, configure `video_vaapi_final_composition = false`.
+
+O Docker serve a WebUI em `https://localhost:8501`. Para conectar o YouTube nesse modo, use `youtube_direct_redirect_uri = "https://localhost:8501"` em `config.toml` e cadastre o mesmo endereço, com HTTPS, nos URIs de redirecionamento autorizados do cliente OAuth no Google Cloud.
 
 ---
 
